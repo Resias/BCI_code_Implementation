@@ -1,0 +1,318 @@
+#!/usr/bin/env python
+import os
+import argparse, json
+import numpy as np
+import random
+
+import torch
+import torch.nn as nn 
+from torch.utils.data import TensorDataset, DataLoader
+from torch.optim.lr_scheduler import StepLR
+
+from sklearn.metrics import cohen_kappa_score
+from scipy.signal import butter, filtfilt
+from tqdm import trange, tqdm 
+
+from moabb.datasets import BNCI2014_001
+from moabb.paradigms import MotorImagery
+
+from model import FeatureExtractor, Critic, Classifier, DANet, train_iter
+from itertools import cycle
+
+import wandb
+
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
+
+
+# 캐시 디렉토리
+CACHE_DIR = "./cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+def set_random_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # 멀티 GPU
+
+    # 연산 일관성 확보 (성능 ↓ 가능)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+# ─────── DSP 유틸 ───────
+def butter_bandpass(x: np.ndarray, low: float, high: float, fs: int, order: int = 4):
+    """논문과 동일한 4차 Butterworth band-pass"""
+    b, a = butter(order, [low/(0.5*fs), high/(0.5*fs)], btype="band")
+    return filtfilt(b, a, x, axis=-1)
+
+def exp_moving_standardize(x: np.ndarray, alpha=0.001, eps=1e-4):
+    """논문에서 쓰인 exponential moving standardization"""
+    # x shape: (n_trials, n_channels, n_times)
+    out = np.empty_like(x, dtype=np.float32)
+    # 채널마다 독립적으로 적용
+    for trial in range(x.shape[0]):
+        mean = np.zeros(x.shape[1])
+        var  = np.ones(x.shape[1])
+        for t in range(x.shape[2]):
+            v = x[trial,:,t]
+            mean = (1-alpha)*mean + alpha*v
+            var  = (1-alpha)*var  + alpha*(v-mean)**2
+            out[trial,:,t] = (v - mean)/np.sqrt(var + eps)
+    return out
+
+def butter_bandpass_batch(X: np.ndarray, subbands, fs: int = 250):
+    n_trials, C, T = X.shape
+    X_filt = []
+    for (fl, fh) in subbands:
+        b, a = butter(4, [fl / (0.5 * fs), fh / (0.5 * fs)], btype="band")
+        X_band = filtfilt(b, a, X, axis=-1)
+        X_filt.append(X_band)
+    X_stack = np.stack(X_filt, axis=1)  # shape: (n_trials, n_subbands, C, T)
+    return X_stack.astype(np.float32)
+
+
+# ─────── 데이터 로드 & 전처리 ───────
+def load_LOO_data(dataset, paradigm, target_subj):
+    # MOABB subjects are 1–9
+    all_subjs = list(range(1,10))
+    t = int(target_subj[1:])           # "A03"→3
+    src_subjs = [s for s in all_subjs if s!=t]
+
+    # (1) source: train session만
+    Xs_all, ys_all, meta_s = paradigm.get_data(dataset=dataset, subjects=src_subjs)
+    mask_s = meta_s['session'] == '0train'
+    Xs, ys = Xs_all[mask_s.values], ys_all[mask_s.values]
+    # (2) target: test session만
+    Xt_all, yt_all, meta_t = paradigm.get_data(dataset=dataset, subjects=[t])
+    mask_t = meta_t['session'] == '1test'
+    Xt, yt = Xt_all[mask_t.values], yt_all[mask_t.values]
+    
+    Xs = Xs[...,:1000]
+    Xt = Xt[...,:1000]
+
+    # (3) 논문과 똑같이 2–6 s 구간 segment가 이미 되어 있으므로
+    #     MOABB가 반환한 Xs, Xt는 shape=(n_trials, n_chan, n_times)
+    #     단, MOABB의 필터가 FIR-based라 다를 수 있으므로
+    #     논문처럼 Butterworth로 다시 필터링하고 standardize
+    fs = 250
+    subbands = [(8,12),(12,16),(16,20),(20,24),(24,28),(28,32)]
+    Xs = butter_bandpass(Xs, 8, 32, fs)
+    Xt = butter_bandpass(Xt, 8, 32, fs)
+    Xs = exp_moving_standardize(Xs)
+    Xt = exp_moving_standardize(Xt)
+    # Xs = exp_moving_standardize(Xs.reshape(-1, Xs.shape[2], Xs.shape[3])).reshape(Xs.shape)
+    # Xt = exp_moving_standardize(Xt.reshape(-1, Xt.shape[2], Xt.shape[3])).reshape(Xt.shape)
+    # (4) label을 0부터 시작하도록 리매핑
+    classes = np.unique(ys)
+    cls2idx = {c: i for i,c in enumerate(classes)}
+    ys = np.vectorize(cls2idx.get)(ys)
+    yt = np.vectorize(cls2idx.get)(yt)
+
+    # torch tensor로 변환
+    return (
+        torch.tensor(Xs, dtype=torch.float32),
+        torch.tensor(ys, dtype=torch.long)
+    ), (
+        torch.tensor(Xt, dtype=torch.float32),
+        torch.tensor(yt, dtype=torch.long)
+    )
+
+# ─────── 이하 기존 코드 ───────
+def make_loader(X, y=None, batch_size=64, shuffle=True):
+    ds = TensorDataset(X) if y is None else TensorDataset(X,y)
+    return DataLoader(ds,
+                      batch_size=batch_size,
+                      drop_last=True)
+
+def evaluate(model, loader):
+    model.eval()
+    Ys, Ps = [], []
+    device = next(model.module.F.parameters()).device
+    with torch.no_grad():
+        for batch in loader:
+            X = batch[0].to(device)
+            _, _, pred = model(X)
+            p_ = pred.argmax(dim=1)
+            Ps.append(p_.cpu())
+            Ys.append(batch[1].cpu())
+
+    y = torch.cat(Ys).numpy()
+    p = torch.cat(Ps).numpy()
+    # print(f" - Prediction logits: {p[:10]}")
+    # print(f" - Prediction (argmax): {y[:10]}")
+    acc = (y==p).mean()
+    kappa = cohen_kappa_score(y,p)
+    return acc, kappa
+
+def load_LOO_data_cached(dataset, paradigm, target_subj):
+    """
+    캐시된 파일이 있으면 불러오고, 없으면 생성 후 저장합니다.
+    저장 파일명: cache/{subj}_2a.pt
+    """
+    cache_path = os.path.join(CACHE_DIR, f"{target_subj}_2a.pt")
+    if os.path.exists(cache_path):
+        # 캐시 로드
+        data = torch.load(cache_path)
+        return data["Xs"], data["ys"], data["Xt"], data["yt"]
+    
+    # 캐시가 없으면 원래 load_LOO_data 로직 수행
+    (Xs, ys), (Xt, yt) = load_LOO_data(dataset, paradigm, target_subj)
+
+    # 캐시에 저장
+    torch.save({
+        "Xs": Xs,
+        "ys": ys,
+        "Xt": Xt,
+        "yt": yt
+    }, cache_path)
+
+    return Xs, ys, Xt, yt
+
+def train_subject(subj, dataset, paradigm, epochs, batch, lr, gp, mu, critic_steps, cri_hid, cls_hid, device):
+    Xs, ys, Xt, yt = load_LOO_data_cached(dataset, paradigm, subj)
+    print(f"Train (source) dataset length: {len(Xs)}")
+    print(f"Validation/Test (target) dataset length: {len(Xt)}")
+    src_loader = make_loader(Xs, ys, batch)
+    tgt_loader = make_loader(Xt, None, batch)
+    test_loader = make_loader(Xt, yt, batch)
+
+    C = Xs.shape[1]  # channels = 22
+    T = Xs.shape[2]  # time points = 1000
+    n_cls = int(ys.max().item()+1)
+    print(f"=== Subject {subj} | C={C}, T={T}, classes={n_cls} ===")
+
+    tmpF = FeatureExtractor(C=C).to(device)
+    d = torch.zeros(4, C, T).to(device)
+    feat_dim = tmpF(d).shape[1]
+
+    model = DANet(C=C, n_cls=n_cls, citic_hid=cri_hid, classifier_hidden=cls_hid, feat_dim=feat_dim)
+    model = nn.DataParallel(model, device_ids=[0,1])
+    model = model.cuda()
+   
+    opt_fc = torch.optim.Adam(list(model.module.F.parameters())+list(model.module.C.parameters()), lr=lr, betas=(0.5,0.9))
+    opt_d = torch.optim.Adam(model.module.D.parameters(), lr=lr, betas=(0.5,0.9))
+    # scheduler_fc = StepLR(opt_fc, step_size=50, gamma=0.5)
+    # scheduler_d = StepLR(opt_d, step_size=50, gamma=0.5)
+    
+    best_acc = 0.0
+    for ep in trange(1, epochs+1, desc=f"{subj} Training"):
+        tgt_iter = cycle(tgt_loader)  # 무한 순환 타겟 배치
+        # train_pairs = zip(src_loader, tgt_loader)
+        batch_bar = tqdm(
+            src_loader,
+            # train_pairs,
+            desc=f"Epoch {ep} (source batches)",
+            leave=False,
+        )
+        sum_lossD = 0.0
+        sum_cls   = 0.0
+        sum_wd    = 0.0
+        n_batches = 0
+        
+        for Xs_b, ys_b in batch_bar:
+            Xt_b, = next(tgt_iter)  # 반복적으로 target 배치 꺼냄
+        # for (Xs_b, ys_b), (Xt_b,) in batch_bar:
+            stats = train_iter(
+                model,
+                Xs_b, ys_b, Xt_b,
+                [opt_fc, opt_d],
+                lambda_gp=gp, mu=mu, critic_steps=critic_steps)
+            # set_postfix로 stats 출력
+            batch_bar.set_postfix(
+                lossD=f"{stats['loss_D']:.5f}",
+                cls=f"{stats['cls']:.5f}",
+                wd=f"{stats['wd']:.5f}"
+            )
+            sum_lossD += stats['loss_D']
+            sum_cls   += stats['cls']
+            sum_wd    += stats['wd']
+            n_batches += 1
+            
+        avg_lossD = sum_lossD / n_batches
+        avg_cls = sum_cls / n_batches
+        avg_wd = sum_wd / n_batches
+        wandb.log({
+            "epoch": ep,
+            "loss_D": avg_lossD,
+            "cls_loss": avg_cls,
+            "wd": avg_wd
+        })        
+        # scheduler_fc.step()
+        # scheduler_d.step()
+        acc, kappa = evaluate(model, test_loader)
+        wandb.log({
+            "epoch": ep,
+            "test/acc": acc,
+            "test/kappa": kappa
+        })
+        if ep%5==0 or ep==epochs:
+            best_acc = max(best_acc, acc)
+            # print(f"\nEp{ep:02d} → acc={acc:.5f}, κ={kappa:.5f}, lossD={stats['loss_D']:.5f}, cls={stats['cls']:.5f}")
+
+    return best_acc, kappa
+
+if __name__=="__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("--epochs", type=int, default=4000)
+    p.add_argument("--batch", type=int, default=256)
+    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--lambda_gp", type=int, default=10)
+    p.add_argument("--critic_steps", type=int, default=5)
+    p.add_argument("--mu", type=float, default=1)
+    p.add_argument("--cri_hid", type=int, default=512)
+    p.add_argument("--cls_hid", type=int, default=512)
+    p.add_argument("--device", default="cuda")
+    args = p.parse_args()
+    
+    # 1) device 설정
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
+    seed = 42
+    set_random_seed(seed)
+    
+    
+    eeg22 = [
+        'Fz','FC3','FC1','FCz','FC2','FC4',
+        'C5','C3','C1','Cz','C2','C4','C6',
+        'CP3','CP1','CPz','CP2','CP4',
+        'P1','Pz','P2','POz'
+    ]
+    dataset = BNCI2014_001()
+    paradigm = MotorImagery(
+        n_classes=4,
+        channels=eeg22,
+        fmin=8, fmax=32,      # 논문과 동일한 단일 밴드
+        tmin=2, tmax=6,
+        resample=250
+    )
+
+    results = {}
+    for i in range(1,10):
+        subj = f"A{i:02d}"
+        wandb.init(project="danet-eeg-tuning", name=subj, config={
+            "epochs": args.epochs,
+            "batch_size": args.batch,
+            "learning_rate": args.lr,
+            "lambda_gp": args.lambda_gp,
+            "mu": args.mu,
+            "critic_steps": args.critic_steps,
+            "seed": seed
+        })
+        acc, κ = train_subject(
+            subj, dataset, paradigm,
+            args.epochs, args.batch, args.lr,
+            args.lambda_gp, args.mu, args.critic_steps,
+            args.cri_hid, args.cls_hid, device
+        )
+        results[subj] = {"accuracy":acc, "kappa":κ}
+        wandb.run.summary["best_acc"] = acc
+        wandb.run.summary["best_kappa"] = κ
+        wandb.finish()
+
+    print("\n=== Final LOO Results ===")
+    with open("result.json", "w") as json_file:
+        json.dump(results, json_file, indent=2)
+    print(json.dumps(results, indent=2))
+    

@@ -1,0 +1,12 @@
+=0.12.0
+Improved_Domain_Adaptation_Network_Based_on_Wasserstein_Distance_for_Motor_Imagery_EEG_Classification.pdf
+result.json
+train.py
+__pycache__/moabb_train.cpython-311.pyc
+__pycache__/model.cpython-310.pyc
+__pycache__/model.cpython-311.pyc
+__pycache__/model.cpython-312.pyc
+cache/
+datasets/2b_gdf/
+datasets/true_labels/
+wandb/
