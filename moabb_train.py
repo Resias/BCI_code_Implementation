@@ -21,8 +21,8 @@ from itertools import cycle
 
 import wandb
 
-torch.backends.cuda.matmul.allow_tf32 = False
-torch.backends.cudnn.allow_tf32 = False
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 
 # 캐시 디렉토리
@@ -180,7 +180,8 @@ def train_subject(subj, dataset, paradigm, epochs, batch, lr, gp, mu, critic_ste
     C = Xs.shape[1]  # channels = 22
     T = Xs.shape[2]  # time points = 1000
     n_cls = int(ys.max().item()+1)
-    print(f"=== Subject {subj} | C={C}, T={T}, classes={n_cls} ===")
+    n_cls_t = int(yt.max().item()+1)
+    print(f"=== Subject {subj} | C={C}, T={T}, classes={n_cls} === | n_cls_t={n_cls_t}")
 
     tmpF = FeatureExtractor(C=C).to(device)
     d = torch.zeros(4, C, T).to(device)
@@ -189,11 +190,13 @@ def train_subject(subj, dataset, paradigm, epochs, batch, lr, gp, mu, critic_ste
     model = DANet(C=C, n_cls=n_cls, citic_hid=cri_hid, classifier_hidden=cls_hid, feat_dim=feat_dim)
     model = nn.DataParallel(model, device_ids=[0,1])
     model = model.cuda()
-   
-    opt_fc = torch.optim.Adam(list(model.module.F.parameters())+list(model.module.C.parameters()), lr=lr, betas=(0.5,0.9))
-    opt_d = torch.optim.Adam(model.module.D.parameters(), lr=lr, betas=(0.5,0.9))
-    # scheduler_fc = StepLR(opt_fc, step_size=50, gamma=0.5)
-    # scheduler_d = StepLR(opt_d, step_size=50, gamma=0.5)
+    
+    weight_decay = 5e-4
+    opt_fc = torch.optim.Adam(list(model.module.F.parameters())+list(model.module.C.parameters()), lr=lr[0], betas=(0.5,0.9), weight_decay=weight_decay)
+    opt_d = torch.optim.Adam(model.module.D.parameters(), lr=lr[1], betas=(0.5,0.9), weight_decay=weight_decay)
+
+    scheduler_fc = torch.optim.lr_scheduler.StepLR(opt_fc, step_size=50, gamma=0.5)
+    scheduler_d  = torch.optim.lr_scheduler.StepLR(opt_d,  step_size=50, gamma=0.5)
     
     best_acc = 0.0
     for ep in trange(1, epochs+1, desc=f"{subj} Training"):
@@ -205,9 +208,11 @@ def train_subject(subj, dataset, paradigm, epochs, batch, lr, gp, mu, critic_ste
             desc=f"Epoch {ep} (source batches)",
             leave=False,
         )
+        
         sum_lossD = 0.0
         sum_cls   = 0.0
-        sum_wd    = 0.0
+        sum_wd_critic = 0.0
+        sum_wd_feat   = 0.0
         n_batches = 0
         
         for Xs_b, ys_b in batch_bar:
@@ -221,25 +226,30 @@ def train_subject(subj, dataset, paradigm, epochs, batch, lr, gp, mu, critic_ste
             # set_postfix로 stats 출력
             batch_bar.set_postfix(
                 lossD=f"{stats['loss_D']:.5f}",
-                cls=f"{stats['cls']:.5f}",
-                wd=f"{stats['wd']:.5f}"
+                cls=f"{stats['cls_loss']:.5f}",
+                wd_critic=f"{stats['wd_critic']:.5f}",
+                wd_feat=f"{stats['wd_feat']:.5f}"
             )
             sum_lossD += stats['loss_D']
-            sum_cls   += stats['cls']
-            sum_wd    += stats['wd']
+            sum_cls   += stats['cls_loss']
+            sum_wd_critic += stats['wd_critic']
+            sum_wd_feat   += stats['wd_feat']
             n_batches += 1
             
-        avg_lossD = sum_lossD / n_batches
-        avg_cls = sum_cls / n_batches
-        avg_wd = sum_wd / n_batches
+        avg_lossD     = sum_lossD / n_batches
+        avg_cls       = sum_cls / n_batches
+        avg_wd_critic = sum_wd_critic / n_batches
+        avg_wd_feat   = sum_wd_feat / n_batches
+        
         wandb.log({
             "epoch": ep,
             "loss_D": avg_lossD,
             "cls_loss": avg_cls,
-            "wd": avg_wd
-        })        
-        # scheduler_fc.step()
-        # scheduler_d.step()
+            "wd_critic": avg_wd_critic,
+            "wd_feat": avg_wd_feat
+        })
+        scheduler_fc.step()
+        scheduler_d.step()
         acc, kappa = evaluate(model, test_loader)
         wandb.log({
             "epoch": ep,
@@ -254,14 +264,15 @@ def train_subject(subj, dataset, paradigm, epochs, batch, lr, gp, mu, critic_ste
 
 if __name__=="__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--epochs", type=int, default=4000)
-    p.add_argument("--batch", type=int, default=256)
-    p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--lambda_gp", type=int, default=10)
-    p.add_argument("--critic_steps", type=int, default=5)
-    p.add_argument("--mu", type=float, default=1)
+    p.add_argument("--epochs", type=int, default=300)
+    p.add_argument("--batch", type=int, default=64)
+    p.add_argument("--critic_lr", type=float, default=5e-4)
+    p.add_argument("--cls_lr", type=float, default=1e-4)
+    p.add_argument("--lambda_gp", type=int, default=20)
+    p.add_argument("--critic_steps", type=int, default=3)
+    p.add_argument("--mu", type=float, default=0.5)
     p.add_argument("--cri_hid", type=int, default=512)
-    p.add_argument("--cls_hid", type=int, default=512)
+    p.add_argument("--cls_hid", type=int, default=256)
     p.add_argument("--device", default="cuda")
     args = p.parse_args()
     
@@ -283,7 +294,6 @@ if __name__=="__main__":
     paradigm = MotorImagery(
         n_classes=4,
         channels=eeg22,
-        fmin=8, fmax=32,      # 논문과 동일한 단일 밴드
         tmin=2, tmax=6,
         resample=250
     )
@@ -291,18 +301,21 @@ if __name__=="__main__":
     results = {}
     for i in range(1,10):
         subj = f"A{i:02d}"
-        wandb.init(project="danet-eeg-tuning", name=subj, config={
+        wandb.init(project="danet-eeg-finded_optuna", name=subj, config={
             "epochs": args.epochs,
             "batch_size": args.batch,
-            "learning_rate": args.lr,
+            "critic learning_rate": args.critic_lr,
+            "cls learning_rate": args.cls_lr,
             "lambda_gp": args.lambda_gp,
             "mu": args.mu,
             "critic_steps": args.critic_steps,
-            "seed": seed
+            "critic_hidden": args.cri_hid,
+            "classifier_hidden": args.cls_hid,
+            # "seed": seed
         })
         acc, κ = train_subject(
             subj, dataset, paradigm,
-            args.epochs, args.batch, args.lr,
+            args.epochs, args.batch, [args.critic_lr, args.cls_lr],
             args.lambda_gp, args.mu, args.critic_steps,
             args.cri_hid, args.cls_hid, device
         )

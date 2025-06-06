@@ -2,11 +2,14 @@
 import optuna
 import json
 import wandb
-from moabb_train import train_subject   # train_subject가 정의된 모듈
+from moabb_train import train_subject, set_random_seed   # train_subject가 정의된 모듈
 from moabb.datasets import BNCI2014_001
 from moabb.paradigms import MotorImagery
 import torch
 
+seed = 42
+set_random_seed(seed)
+    
 # 공통 설정
 dataset = BNCI2014_001()
 eeg22 = [
@@ -30,9 +33,9 @@ def objective(trial):
     lambda_gp = trial.suggest_int("lambda_gp", 1, 20)
     critic_steps = trial.suggest_int("critic_steps", 5, 10)
     mu = trial.suggest_float("mu", 0.1, 5.0)
-    cri_hid = trial.suggest_categorical("cri_hid", [128, 256, 512, 1024])
-    cls_hid = trial.suggest_categorical("cls_hid", [128, 256, 512, 1024])
-    epochs = 500  # 탐색 단계에선 짧게 잡는 것이 일반적
+    cri_hid = trial.suggest_categorical("cri_hid", [256, 512, 1024, 2048, 4096])
+    cls_hid = trial.suggest_categorical("cls_hid", [256, 512, 1024, 2048, 4096])
+    epochs = 1000  # 탐색 단계에선 짧게 잡는 것이 일반적
     batch = 256
     
     config = {
@@ -46,7 +49,7 @@ def objective(trial):
         "batch": batch,
     }
     
-    wandb.init(project="danet-optuna", config=config, reinit=True)
+    wandb.init(project="danet-optuna-4critic", config=config, reinit=True)
 
     # 2) LOO(subject A01)에 대해 성능 측정
     subj = "A01"
@@ -75,7 +78,7 @@ if __name__ == "__main__":
         sampler=optuna.samplers.TPESampler(seed=42),
         pruner=optuna.pruners.MedianPruner(n_warmup_steps=5),
     )
-    study.optimize(objective, n_trials=50)
+    study.optimize(objective, n_trials=1000)
 
     print("Best trial:")
     trial = study.best_trial

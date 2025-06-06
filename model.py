@@ -131,12 +131,14 @@ class DepthwiseConv(nn.Module):
             groups=bands,
             bias=False
         )
+        self.bn_dw = nn.BatchNorm2d(bands * depth_multiplier)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, m, C, T)
         B, m, C, T = x.shape
         # 1) 바로 depthwise conv: (B, m, C, T) → (B, m*d, 1, T)
         y = self.dw(x)
+        y = self.bn_dw(y)         # BatchNorm 적용
         # 2) 채널(axis=1) 차원 m*d 를 (m, d) 로 분리
         y = y.view(B, m, self.depth, 1, T)      # (B, m, d, 1, T)
         # 3) 축 순서 바꿔서 (B, d, m, 1, T) 로
@@ -231,14 +233,15 @@ class Critic(nn.Module):
             )
     def forward(self,h):
         return self.net(h).view(-1)
+
 # class Critic(nn.Module):
-#     def __init__(self, in_dim: int, hidden_dim: int = 2048, num_layers: int = 4):
+#     def __init__(self, in_dim: int, hid: int = 2048, num_layers: int = 4):
 #         super().__init__()
 #         layers = []
-#         layers.append(nn.Linear(in_dim, hidden_dim))
+#         layers.append(nn.Linear(in_dim, hid))
 #         for _ in range(num_layers - 1):
-#             layers.append(nn.Linear(hidden_dim, hidden_dim))
-#         layers.append(nn.Linear(hidden_dim, 1))
+#             layers.append(nn.Linear(hid, hid))
+#         layers.append(nn.Linear(hid, 1))
 #         self.layers = nn.ModuleList(layers)
 
 #     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -267,8 +270,12 @@ class Classifier(nn.Module):
         super().__init__()
         self.fc1=nn.Linear(in_dim,hidden)
         self.fc2=nn.Linear(hidden,n_cls)
+        self.bn1 = nn.BatchNorm1d(hidden)
+        self.dropout = nn.Dropout(p=0.6)
     def forward(self,h):
-        return F.softmax(self.fc2(F.relu(self.fc1(h))), dim=1)
+        h = F.relu(self.bn1(self.fc1(h)))
+        h = self.dropout(h)
+        return F.softmax(self.fc2(h), dim=1)
 
 # -------------------------------------------------------------
 # 4. DANet wrapper
@@ -301,6 +308,7 @@ def train_iter(model, src_x, src_y, tgt_x, opts,
     # exit()
     model.eval()
     model.module.D.train()
+    wd_critic_list, wd_feat_list = [], []
     # ── (i) critic update ─────────────────────────────
     for _ in range(critic_steps):
         opt_d.zero_grad()
@@ -312,11 +320,13 @@ def train_iter(model, src_x, src_y, tgt_x, opts,
             h_s = h_s.detach()
             h_t = h_t.detach()
 
-        wd = model.module.D(h_s).mean() - model.module.D(h_t).mean()
+        wd_critic  = model.module.D(h_s).mean() - model.module.D(h_t).mean()
         gp = gradient_penalty(Cri, h_s, h_t, lambda_gp)
-        loss_d = -(wd) + gp          # gradient ASCENT
+        loss_d = -(wd_critic) + gp          # gradient ASCENT
         loss_d.backward()
         opt_d.step()
+        wd_critic_list.append(wd_critic.item())   # Critic 직후의 wd 기록
+    wd_critic_mean = float(np.mean(wd_critic_list))
     
     # ── (ii) feature + classifier update ─────────────
     model.train()
@@ -327,15 +337,19 @@ def train_iter(model, src_x, src_y, tgt_x, opts,
     cls_loss = F.cross_entropy(logit, src_y)
     
     h_t, _, _ = model(tgt_x)
-    wd = model.module.D(h_s).mean() - model.module.D(h_t).mean()
+    wd_feat = model.module.D(h_s).mean() - model.module.D(h_t).mean()
 
-    loss_f = wd * mu + cls_loss
+    loss_f = wd_feat * mu + cls_loss
     loss_f.backward()
     opt_fc.step()
+    wd_feat_list.append(wd_feat.item())   # Feature 단계 직후의 wd 기록
 
-    return {'loss_D': loss_d.item(),
-            'wd'    : wd.item(),
-            'cls'   : cls_loss.item()}
+    return {
+        'loss_D': loss_d.item(),
+        'wd_critic': wd_critic_mean,
+        'wd_feat': wd_feat.item(),
+        'cls_loss': cls_loss.item()
+    }
 
 def main():
     B, C, T = 4, 22, 1000
