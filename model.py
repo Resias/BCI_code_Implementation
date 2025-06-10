@@ -132,35 +132,80 @@ class DepthwiseConv(nn.Module):
             bias=False
         )
         self.bn_dw = nn.BatchNorm2d(bands * depth_multiplier)
+        self.activation = nn.ELU()
+        self.dropout = nn.Dropout(p=0.25)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, m, C, T)
         B, m, C, T = x.shape
         # 1) 바로 depthwise conv: (B, m, C, T) → (B, m*d, 1, T)
         y = self.dw(x)
-        y = self.bn_dw(y)         # BatchNorm 적용
+        y = self.bn_dw(y)                       # BatchNorm 적용
         # 2) 채널(axis=1) 차원 m*d 를 (m, d) 로 분리
-        y = y.view(B, m, self.depth, 1, T)      # (B, m, d, 1, T)
-        # 3) 축 순서 바꿔서 (B, d, m, 1, T) 로
-        y = y.permute(0, 2, 1, 3, 4)
+        y = self.activation(y)                  # 활성화 함수
+        y = self.dropout(y)                     # 드롭아웃
+        # y = y.view(B, m, self.depth, 1, T)      # (B, m, d, 1, T)
+        # # 3) 축 순서 바꿔서 (B, d, m, 1, T) 로
+        # y = y.permute(0, 2, 1, 3, 4)
         return y
 
+# class VarianceLayer(nn.Module):
+#     def __init__(self, w):
+#         super().__init__()
+#         self.w = w
+#     def forward(self, x):   # (B,m,d,1,T)
+#         *front, T = x.shape
+#         pad_len = (-T) % self.w
+#         if pad_len > 0:
+#             x = F.pad(x, (0, pad_len), mode='constant', value=0.0)
+#         new_T = x.size(-1)
+#         num_win = new_T // self.w
+        
+#         x = x.view(*front, num_win, self.w)
+        
+#         v = x.var(dim=-1, unbiased=False)
+#         return torch.clamp(v, min=1e-6)
+
 class VarianceLayer(nn.Module):
-    def __init__(self, w):
-        super().__init__()
+    """
+    Variance Layer: computes variance over non-overlapping temporal windows.
+
+    Input:
+        x of shape (B, C, 1, T)
+          - B: batch size
+          - C: 채널 수 (e.g., m * d)
+          - 1: spatial 차원 (이미 합쳐진 상태)
+          - T: 전체 타임포인트 수
+
+    Output:
+        y of shape (B, C, 1, K), where K = T // w
+    """
+    def __init__(self, w: int):
+        super(VarianceLayer, self).__init__()
         self.w = w
-    def forward(self, x):   # (B,m,d,1,T)
-        *front, T = x.shape
-        pad_len = (-T) % self.w
-        if pad_len > 0:
-            x = F.pad(x, (0, pad_len), mode='constant', value=0.0)
-        new_T = x.size(-1)
-        num_win = new_T // self.w
-        
-        x = x.view(*front, num_win, self.w)
-        
-        v = x.var(dim=-1, unbiased=False)
-        return torch.clamp(v, min=1e-6)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 1) 차원 정리
+        #   x: (B, C, 1, T) → squeeze하여 (B, C, T)
+        B, C, _, T = x.shape
+        x = x.view(B, C, T)
+
+        # 2) 창 개수 계산 및 불필요한 마지막 부분 자르기
+        K = T // self.w
+        x = x[:, :, :K * self.w]          # (B, C, K*w)
+
+        # 3) (B, C, K, w) 형태로 뷰 변경
+        x = x.view(B, C, K, self.w)
+
+        # 4) 시간평균 µ(k) 계산: (B, C, K, 1)
+        mu = x.mean(dim=-1, keepdim=True)
+
+        # 5) 분산 계산: (B, C, K)
+        var = ((x - mu) ** 2).mean(dim=-1)
+
+        # 6) 출력 형태 맞추기: (B, C, 1, K)
+        y = var.unsqueeze(2)
+        return y
 
 
 class FeatureExtractor(nn.Module):
@@ -221,18 +266,31 @@ class FeatureExtractor(nn.Module):
 # -------------------------------------------------------------
 # 2. Domain Discriminator (Critic)
 # -------------------------------------------------------------
+# class Critic(nn.Module):
+#     def __init__(self, in_dim, hid=2048):
+#         super().__init__()
+#         self.net = nn.Sequential(
+#             nn.Linear(in_dim,hid),
+#             nn.LeakyReLU(.2,True),
+#             nn.Linear(hid,hid),
+#             nn.LeakyReLU(.2,True),
+#             nn.Linear(hid,1)
+#             )
+#     def forward(self,h):
+#         return self.net(h).view(-1)
 class Critic(nn.Module):
-    def __init__(self, in_dim, hid=2048):
+    def __init__(self, in_dim, hid=[512,256]):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim,hid),
-            nn.LeakyReLU(.2,True),
-            nn.Linear(hid,hid),
-            nn.LeakyReLU(.2,True),
-            nn.Linear(hid,1)
-            )
-    def forward(self,h):
-        return self.net(h).view(-1)
+        layers = []
+        dims = [in_dim] + hid
+        for in_d, out_d in zip(dims[:-1], dims[1:]):
+            layers += [nn.Linear(in_d, out_d),
+                       nn.LeakyReLU(0.2, True)]
+        layers += [nn.Linear(hid[-1], 1)]
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, h):
+        return self.net(h).view(-1, 1)
 
 # class Critic(nn.Module):
 #     def __init__(self, in_dim: int, hid: int = 2048, num_layers: int = 4):
@@ -273,22 +331,25 @@ class Classifier(nn.Module):
         self.bn1 = nn.BatchNorm1d(hidden)
         self.dropout = nn.Dropout(p=0.6)
     def forward(self,h):
-        h = F.relu(self.bn1(self.fc1(h)))
-        h = self.dropout(h)
+        h = self.fc1(h)
+        # h = self.bn1(h)
+        h = F.relu(h)
+        # h = self.dropout(h)
         return F.softmax(self.fc2(h), dim=1)
 
 # -------------------------------------------------------------
 # 4. DANet wrapper
 # -------------------------------------------------------------
 class DANet(nn.Module):
-    def __init__(self, C=22, n_cls=4, citic_hid=512, classifier_hidden=512, feat_dim=None):
+    def __init__(self, C=22, n_cls=4, citic_hid=512, classifier_hidden=64, feat_dim=None):
         super().__init__()
         self.F = FeatureExtractor(C=C)
         if feat_dim is None:
             # 만일 누락되면 안전장치
             sample = torch.zeros(1, C, 1000)
             feat_dim = self.F(sample).shape[1]
-        self.D = Critic(feat_dim, hid=citic_hid)
+        # self.D = Critic(feat_dim, hid=citic_hid)
+        self.D = Critic(feat_dim)
         self.C = Classifier(feat_dim, n_cls, hidden=classifier_hidden)
     def forward(self, x):
         h = self.F(x)
@@ -320,7 +381,7 @@ def train_iter(model, src_x, src_y, tgt_x, opts,
             h_s = h_s.detach()
             h_t = h_t.detach()
 
-        wd_critic  = model.module.D(h_s).mean() - model.module.D(h_t).mean()
+        wd_critic = model.module.D(h_s).mean() - model.module.D(h_t).mean()
         gp = gradient_penalty(Cri, h_s, h_t, lambda_gp)
         loss_d = -(wd_critic) + gp          # gradient ASCENT
         loss_d.backward()
@@ -339,7 +400,7 @@ def train_iter(model, src_x, src_y, tgt_x, opts,
     h_t, _, _ = model(tgt_x)
     wd_feat = model.module.D(h_s).mean() - model.module.D(h_t).mean()
 
-    loss_f = wd_feat * mu + cls_loss
+    loss_f = (wd_feat * mu) + cls_loss
     loss_f.backward()
     opt_fc.step()
     wd_feat_list.append(wd_feat.item())   # Feature 단계 직후의 wd 기록
@@ -348,7 +409,8 @@ def train_iter(model, src_x, src_y, tgt_x, opts,
         'loss_D': loss_d.item(),
         'wd_critic': wd_critic_mean,
         'wd_feat': wd_feat.item(),
-        'cls_loss': cls_loss.item()
+        'cls_loss': cls_loss.item(),
+        'loss_f': loss_f.item()
     }
 
 def main():
@@ -377,6 +439,6 @@ def main():
     print("DANet Feature:", feat2.shape)
     print("DANet Critic:", net.D(feat2).shape)
     print("DANet Classifier:", net.C(feat2).shape)
-    
+
 if __name__ == "__main__":
     main()

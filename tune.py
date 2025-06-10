@@ -29,14 +29,19 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def objective(trial):
     # 1) 탐색할 하이퍼파라미터 정의
-    lr = trial.suggest_loguniform("lr", 1e-5, 1e-4)
-    lambda_gp = trial.suggest_int("lambda_gp", 1, 20)
-    critic_steps = trial.suggest_int("critic_steps", 5, 10)
-    mu = trial.suggest_float("mu", 0.1, 5.0)
-    cri_hid = trial.suggest_categorical("cri_hid", [256, 512, 1024, 2048, 4096])
-    cls_hid = trial.suggest_categorical("cls_hid", [256, 512, 1024, 2048, 4096])
-    epochs = 1000  # 탐색 단계에선 짧게 잡는 것이 일반적
-    batch = 256
+    # lr = trial.suggest_loguniform("lr", 5e-4)
+    # lambda_gp = trial.suggest_int("lambda_gp", 5, 20)
+    critic_steps = trial.suggest_int("critic_steps", 1, 5)
+    cri_hid = trial.suggest_categorical("cri_hid", [128, 256, 512, 1024, 2048])
+    cls_hid = trial.suggest_categorical("cls_hid", [128, 256, 512, 1024, 2048])
+    # mu = trial.suggest_float("mu", 1.0, 5.0)
+    mu = 1.0
+    lambda_gp = 10 
+    # cri_hid = 2048
+    # cls_hid = 1024
+    epochs = 180  # 탐색 단계에선 짧게 잡는 것이 일반적
+    batch = 64
+    lr = 1e-4
     
     config = {
         "lr": lr,
@@ -49,7 +54,7 @@ def objective(trial):
         "batch": batch,
     }
     
-    wandb.init(project="danet-optuna-4critic", config=config, reinit=True)
+    wandb.init(project="danet-optuna-0609", config=config, reinit=True)
 
     # 2) LOO(subject A01)에 대해 성능 측정
     subj = "A01"
@@ -59,7 +64,7 @@ def objective(trial):
         paradigm=paradigm,
         epochs=epochs,
         batch=batch,
-        lr=lr,
+        lr=[lr,lr],
         gp=lambda_gp,
         mu=mu,
         critic_steps=critic_steps,
@@ -73,12 +78,14 @@ def objective(trial):
     return acc  # 또는 kappa
 
 if __name__ == "__main__":
+    seed = 42
+    set_random_seed(seed)
     study = optuna.create_study(
         direction="maximize",
         sampler=optuna.samplers.TPESampler(seed=42),
-        pruner=optuna.pruners.MedianPruner(n_warmup_steps=5),
+        # pruner=optuna.pruners.MedianPruner(n_warmup_steps=5),
     )
-    study.optimize(objective, n_trials=1000)
+    study.optimize(objective, n_trials=500)
 
     print("Best trial:")
     trial = study.best_trial

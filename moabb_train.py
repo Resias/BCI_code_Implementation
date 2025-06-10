@@ -97,8 +97,8 @@ def load_LOO_data(dataset, paradigm, target_subj):
     #     논문처럼 Butterworth로 다시 필터링하고 standardize
     fs = 250
     subbands = [(8,12),(12,16),(16,20),(20,24),(24,28),(28,32)]
-    Xs = butter_bandpass(Xs, 8, 32, fs)
-    Xt = butter_bandpass(Xt, 8, 32, fs)
+    Xs = butter_bandpass(Xs, 8, 30, fs)
+    Xt = butter_bandpass(Xt, 8, 30, fs)
     Xs = exp_moving_standardize(Xs)
     Xt = exp_moving_standardize(Xt)
     # Xs = exp_moving_standardize(Xs.reshape(-1, Xs.shape[2], Xs.shape[3])).reshape(Xs.shape)
@@ -191,9 +191,9 @@ def train_subject(subj, dataset, paradigm, epochs, batch, lr, gp, mu, critic_ste
     model = nn.DataParallel(model, device_ids=[0,1])
     model = model.cuda()
     
-    weight_decay = 5e-4
-    opt_fc = torch.optim.Adam(list(model.module.F.parameters())+list(model.module.C.parameters()), lr=lr[0], betas=(0.5,0.9), weight_decay=weight_decay)
-    opt_d = torch.optim.Adam(model.module.D.parameters(), lr=lr[1], betas=(0.5,0.9), weight_decay=weight_decay)
+    # weight_decay = 5e-4
+    opt_fc = torch.optim.Adam(list(model.module.F.parameters())+list(model.module.C.parameters()), lr=lr[1])
+    opt_d = torch.optim.Adam(model.module.D.parameters(), lr=lr[0])
 
     scheduler_fc = torch.optim.lr_scheduler.StepLR(opt_fc, step_size=50, gamma=0.5)
     scheduler_d  = torch.optim.lr_scheduler.StepLR(opt_d,  step_size=50, gamma=0.5)
@@ -210,9 +210,10 @@ def train_subject(subj, dataset, paradigm, epochs, batch, lr, gp, mu, critic_ste
         )
         
         sum_lossD = 0.0
-        sum_cls   = 0.0
+        sum_lossF = 0.0
+        sum_cls = 0.0
         sum_wd_critic = 0.0
-        sum_wd_feat   = 0.0
+        sum_wd_feat = 0.0
         n_batches = 0
         
         for Xs_b, ys_b in batch_bar:
@@ -234,22 +235,25 @@ def train_subject(subj, dataset, paradigm, epochs, batch, lr, gp, mu, critic_ste
             sum_cls   += stats['cls_loss']
             sum_wd_critic += stats['wd_critic']
             sum_wd_feat   += stats['wd_feat']
+            sum_lossF   += stats['loss_f']
             n_batches += 1
-            
+        
         avg_lossD     = sum_lossD / n_batches
         avg_cls       = sum_cls / n_batches
         avg_wd_critic = sum_wd_critic / n_batches
         avg_wd_feat   = sum_wd_feat / n_batches
+        avg_lossF   = sum_lossF / n_batches
         
         wandb.log({
             "epoch": ep,
             "loss_D": avg_lossD,
             "cls_loss": avg_cls,
             "wd_critic": avg_wd_critic,
-            "wd_feat": avg_wd_feat
+            "wd_feat": avg_wd_feat,
+            "loss_F": avg_lossF
         })
-        scheduler_fc.step()
-        scheduler_d.step()
+        # scheduler_fc.step()
+        # scheduler_d.step()
         acc, kappa = evaluate(model, test_loader)
         wandb.log({
             "epoch": ep,
@@ -264,15 +268,15 @@ def train_subject(subj, dataset, paradigm, epochs, batch, lr, gp, mu, critic_ste
 
 if __name__=="__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--epochs", type=int, default=300)
+    p.add_argument("--epochs", type=int, default=800)
     p.add_argument("--batch", type=int, default=64)
-    p.add_argument("--critic_lr", type=float, default=5e-4)
+    p.add_argument("--critic_lr", type=float, default=1e-4)
     p.add_argument("--cls_lr", type=float, default=1e-4)
-    p.add_argument("--lambda_gp", type=int, default=20)
-    p.add_argument("--critic_steps", type=int, default=3)
-    p.add_argument("--mu", type=float, default=0.5)
-    p.add_argument("--cri_hid", type=int, default=512)
-    p.add_argument("--cls_hid", type=int, default=256)
+    p.add_argument("--lambda_gp", type=int, default=10)
+    p.add_argument("--critic_steps", type=int, default=5)
+    p.add_argument("--mu", type=float, default=1)
+    p.add_argument("--cri_hid", type=int, default=64)
+    p.add_argument("--cls_hid", type=int, default=64)
     p.add_argument("--device", default="cuda")
     args = p.parse_args()
     
@@ -282,7 +286,6 @@ if __name__=="__main__":
     
     seed = 42
     set_random_seed(seed)
-    
     
     eeg22 = [
         'Fz','FC3','FC1','FCz','FC2','FC4',
@@ -301,7 +304,7 @@ if __name__=="__main__":
     results = {}
     for i in range(1,10):
         subj = f"A{i:02d}"
-        wandb.init(project="danet-eeg-finded_optuna", name=subj, config={
+        wandb.init(project="danet-eeg-0610", name=subj, config={
             "epochs": args.epochs,
             "batch_size": args.batch,
             "critic learning_rate": args.critic_lr,
@@ -309,7 +312,7 @@ if __name__=="__main__":
             "lambda_gp": args.lambda_gp,
             "mu": args.mu,
             "critic_steps": args.critic_steps,
-            "critic_hidden": args.cri_hid,
+            # "critic_hidden": args.cri_hid,
             "classifier_hidden": args.cls_hid,
             # "seed": seed
         })
