@@ -210,7 +210,7 @@ class VarianceLayer(nn.Module):
 
 class FeatureExtractor(nn.Module):
     def __init__(self, C=22, subbands=((8,12),(12,16),(16,20),(20,24),(24,28),(28,32)),
-                 depth=2, var_win=250, fs=250, fc_out=64):
+                 depth=7, var_win=250, fs=250, fc_out=64):
         super().__init__()
         self.fs = fs
         self.subbands = subbands
@@ -257,10 +257,10 @@ class FeatureExtractor(nn.Module):
         feats = self.fft_bp(x)         # (B, m, C, T)
         
         feats = self.depth_convs(feats)             # (B, d, m, 1, T)
-        feats = self.var(feats)                     # (B, d, m, 1, T//w)
+        out = self.var(feats)                     # (B, d, m, 1, T//w)
 
-        flat = feats.flatten(1)                # (B, d*m*(T//w))
-        out  = self.fc(flat)                 # (B, fc_out=64)
+        # out = out.flatten(1)                # (B, d*m*(T//w))
+        # out  = self.fc(out)                 # (B, fc_out=64)
         return out.flatten(1)                    # Flatten to (B, total_features)
 
 # -------------------------------------------------------------
@@ -292,23 +292,6 @@ class Critic(nn.Module):
     def forward(self, h):
         return self.net(h).view(-1, 1)
 
-# class Critic(nn.Module):
-#     def __init__(self, in_dim: int, hid: int = 2048, num_layers: int = 4):
-#         super().__init__()
-#         layers = []
-#         layers.append(nn.Linear(in_dim, hid))
-#         for _ in range(num_layers - 1):
-#             layers.append(nn.Linear(hid, hid))
-#         layers.append(nn.Linear(hid, 1))
-#         self.layers = nn.ModuleList(layers)
-
-#     def forward(self, x: torch.Tensor) -> torch.Tensor:
-#         h = x
-#         for layer in self.layers[:-1]:
-#             h = F.relu(layer(h))
-#         out = self.layers[-1](h)
-#         return out.view(-1)
-
 
 # Gradient penalty
 def gradient_penalty(critic, h_s, h_t, lambda_gp):
@@ -333,7 +316,7 @@ class Classifier(nn.Module):
     def forward(self,h):
         h = self.fc1(h)
         # h = self.bn1(h)
-        h = F.relu(h)
+        # h = F.relu(h)
         # h = self.dropout(h)
         return F.softmax(self.fc2(h), dim=1)
 
@@ -362,7 +345,7 @@ def train_iter(model, src_x, src_y, tgt_x, opts,
                lambda_gp=10, mu=1.0, critic_steps=5):
 
     Fnet, Clf, Cri = model.module.F, model.module.C, model.module.D
-    opt_fc, opt_d = opts
+    opt_fc, opt_c, opt_d = opts
     device = next(Fnet.parameters()).device
     src_x, src_y, tgt_x = src_x.to(device), src_y.to(device), tgt_x.to(device)
     # print(src_x.shape, src_y.shape, tgt_x.shape)
@@ -372,8 +355,6 @@ def train_iter(model, src_x, src_y, tgt_x, opts,
     wd_critic_list, wd_feat_list = [], []
     # ── (i) critic update ─────────────────────────────
     for _ in range(critic_steps):
-        opt_d.zero_grad()
-
         # 특징은 gradient 차단
         with torch.no_grad():
             h_s, _, _ = model(src_x)   # 여러 GPU에서 분산 계산
@@ -384,23 +365,31 @@ def train_iter(model, src_x, src_y, tgt_x, opts,
         wd_critic = model.module.D(h_s).mean() - model.module.D(h_t).mean()
         gp = gradient_penalty(Cri, h_s, h_t, lambda_gp)
         loss_d = -(wd_critic) + gp          # gradient ASCENT
+        
+        opt_d.zero_grad()
         loss_d.backward()
         opt_d.step()
+        
         wd_critic_list.append(wd_critic.item())   # Critic 직후의 wd 기록
     wd_critic_mean = float(np.mean(wd_critic_list))
     
     # ── (ii) feature + classifier update ─────────────
     model.train()
     model.module.D.eval()
-    opt_fc.zero_grad()
-
+    
     h_s, _, logit = model(src_x)
-    cls_loss = F.cross_entropy(logit, src_y)
+    loss_c = F.cross_entropy(logit, src_y)
+    loss_c_copy = loss_c.detach().clone()  # retain_graph=True 필요
+    opt_c.zero_grad()
+    loss_c.backward(retain_graph=True)  # retain_graph=True 필요
+    opt_c.step()
     
     h_t, _, _ = model(tgt_x)
     wd_feat = model.module.D(h_s).mean() - model.module.D(h_t).mean()
 
-    loss_f = (wd_feat * mu) + cls_loss
+    loss_f = (wd_feat * mu) + loss_c_copy
+    
+    opt_fc.zero_grad()
     loss_f.backward()
     opt_fc.step()
     wd_feat_list.append(wd_feat.item())   # Feature 단계 직후의 wd 기록
@@ -409,7 +398,7 @@ def train_iter(model, src_x, src_y, tgt_x, opts,
         'loss_D': loss_d.item(),
         'wd_critic': wd_critic_mean,
         'wd_feat': wd_feat.item(),
-        'cls_loss': cls_loss.item(),
+        'cls_loss': loss_c.item(),
         'loss_f': loss_f.item()
     }
 

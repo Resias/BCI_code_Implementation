@@ -192,8 +192,9 @@ def train_subject(subj, dataset, paradigm, epochs, batch, lr, gp, mu, critic_ste
     model = model.cuda()
     
     # weight_decay = 5e-4
-    opt_fc = torch.optim.Adam(list(model.module.F.parameters())+list(model.module.C.parameters()), lr=lr[1])
-    opt_d = torch.optim.Adam(model.module.D.parameters(), lr=lr[0])
+    opt_fc = torch.optim.Adam(list(model.module.F.parameters()), lr=lr[1])
+    opt_c = torch.optim.Adam(list(model.module.C.parameters()), lr=lr[1])
+    opt_d = torch.optim.Adam(list(model.module.D.parameters()), lr=lr[0], betas=(0.5, 0.9))
 
     scheduler_fc = torch.optim.lr_scheduler.StepLR(opt_fc, step_size=50, gamma=0.5)
     scheduler_d  = torch.optim.lr_scheduler.StepLR(opt_d,  step_size=50, gamma=0.5)
@@ -222,7 +223,7 @@ def train_subject(subj, dataset, paradigm, epochs, batch, lr, gp, mu, critic_ste
             stats = train_iter(
                 model,
                 Xs_b, ys_b, Xt_b,
-                [opt_fc, opt_d],
+                [opt_fc, opt_c, opt_d],
                 lambda_gp=gp, mu=mu, critic_steps=critic_steps)
             # set_postfix로 stats 출력
             batch_bar.set_postfix(
@@ -271,7 +272,7 @@ if __name__=="__main__":
     p.add_argument("--epochs", type=int, default=800)
     p.add_argument("--batch", type=int, default=64)
     p.add_argument("--critic_lr", type=float, default=1e-4)
-    p.add_argument("--cls_lr", type=float, default=1e-4)
+    p.add_argument("--cls_lr", type=float, default=5e-4)
     p.add_argument("--lambda_gp", type=int, default=10)
     p.add_argument("--critic_steps", type=int, default=5)
     p.add_argument("--mu", type=float, default=1)
