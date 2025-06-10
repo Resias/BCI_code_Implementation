@@ -210,7 +210,7 @@ class VarianceLayer(nn.Module):
 
 class FeatureExtractor(nn.Module):
     def __init__(self, C=22, subbands=((8,12),(12,16),(16,20),(20,24),(24,28),(28,32)),
-                 depth=7, var_win=250, fs=250, fc_out=64):
+                 depth=22, var_win=250, fs=250, fc_out=64):
         super().__init__()
         self.fs = fs
         self.subbands = subbands
