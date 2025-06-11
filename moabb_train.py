@@ -6,7 +6,7 @@ import random
 
 import torch
 import torch.nn as nn 
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import TensorDataset, DataLoader, RandomSampler
 from torch.optim.lr_scheduler import StepLR
 
 from sklearn.metrics import cohen_kappa_score
@@ -174,7 +174,28 @@ def train_subject(subj, dataset, paradigm, epochs, batch, lr, gp, mu, critic_ste
     print(f"Train (source) dataset length: {len(Xs)}")
     print(f"Validation/Test (target) dataset length: {len(Xt)}")
     src_loader = make_loader(Xs, ys, batch)
-    tgt_loader = make_loader(Xt, None, batch)
+    # tgt_loader = make_loader(Xt, None, batch)
+    
+    # --- 랜덤 복원추출 sampler 설정 ---
+    # 몇 번의 배치를 뽑을지: src_loader 배치 수와 동일하게
+    num_src_batches = len(src_loader)
+
+    # TensorDataset 으로 다시 감싸고
+    tgt_dataset = TensorDataset(Xt)
+    # replacement=True 로 복원추출, 전체 샘플 수 = num_src_batches * batch
+    tgt_sampler = RandomSampler(
+        tgt_dataset,
+        replacement=True,
+        num_samples=num_src_batches * batch
+    )
+    # DataLoader 에 sampler 전달 (shuffle=False)
+    tgt_loader = DataLoader(
+        tgt_dataset,
+        batch_size=batch,
+        sampler=tgt_sampler,
+        drop_last=True
+    )
+    
     test_loader = make_loader(Xt, yt, batch)
 
     C = Xs.shape[1]  # channels = 22
@@ -208,8 +229,10 @@ def train_subject(subj, dataset, paradigm, epochs, batch, lr, gp, mu, critic_ste
     patience = 200             # 개선이 없을 때 최대 허용 Epoch 수
     epochs_no_improve = 0
     for ep in trange(1, epochs+1, desc=f"{subj} Training"):
-        tgt_iter = cycle(tgt_loader)  # 무한 순환 타겟 배치
+        # tgt_iter = cycle(tgt_loader)  # 무한 순환 타겟 배치
         # train_pairs = zip(src_loader, tgt_loader)
+        # epoch마다 새로운 랜덤 시퀀스 iterator 생성
+        tgt_iter = iter(tgt_loader)
         batch_bar = tqdm(
             src_loader,
             # train_pairs,
@@ -289,11 +312,11 @@ if __name__=="__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--epochs", type=int, default=8000)
     p.add_argument("--batch", type=int, default=64)
-    p.add_argument("--critic_lr", type=float, default=1e-4)
-    p.add_argument("--cls_lr", type=float, default=8e-4)
+    p.add_argument("--critic_lr", type=float, default=5e-4)
+    p.add_argument("--cls_lr", type=float, default=5e-4)
     p.add_argument("--lambda_gp", type=int, default=10)
     p.add_argument("--critic_steps", type=int, default=5)
-    p.add_argument("--mu", type=float, default=0.5)
+    p.add_argument("--mu", type=float, default=1)
     p.add_argument("--cri_hid", type=int, default=64)
     p.add_argument("--depth_multiplier", type=int, default=2)
     p.add_argument("--cls_hid", type=int, default=64)
