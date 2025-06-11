@@ -78,7 +78,6 @@ def load_LOO_data(dataset, paradigm, target_subj):
     all_subjs = list(range(1,10))
     t = int(target_subj[1:])           # "A03"→3
     src_subjs = [s for s in all_subjs if s!=t]
-
     # (1) source: train session만
     Xs_all, ys_all, meta_s = paradigm.get_data(dataset=dataset, subjects=src_subjs)
     mask_s = meta_s['session'] == '0train'
@@ -88,8 +87,8 @@ def load_LOO_data(dataset, paradigm, target_subj):
     mask_t = meta_t['session'] == '1test'
     Xt, yt = Xt_all[mask_t.values], yt_all[mask_t.values]
     
-    Xs = Xs[...,:1000]
-    Xt = Xt[...,:1000]
+    Xs = Xs[:, :, :-1]
+    Xt = Xt[:, :, :-1]
 
     # (3) 논문과 똑같이 2–6 s 구간 segment가 이미 되어 있으므로
     #     MOABB가 반환한 Xs, Xt는 shape=(n_trials, n_chan, n_times)
@@ -97,8 +96,8 @@ def load_LOO_data(dataset, paradigm, target_subj):
     #     논문처럼 Butterworth로 다시 필터링하고 standardize
     fs = 250
     subbands = [(8,12),(12,16),(16,20),(20,24),(24,28),(28,32)]
-    Xs = butter_bandpass(Xs, 8, 30, fs)
-    Xt = butter_bandpass(Xt, 8, 30, fs)
+    Xs = butter_bandpass(Xs, 8, 32, fs)
+    Xt = butter_bandpass(Xt, 8, 32, fs)
     Xs = exp_moving_standardize(Xs)
     Xt = exp_moving_standardize(Xt)
     # Xs = exp_moving_standardize(Xs.reshape(-1, Xs.shape[2], Xs.shape[3])).reshape(Xs.shape)
@@ -106,6 +105,7 @@ def load_LOO_data(dataset, paradigm, target_subj):
     # (4) label을 0부터 시작하도록 리매핑
     classes = np.unique(ys)
     cls2idx = {c: i for i,c in enumerate(classes)}
+
     ys = np.vectorize(cls2idx.get)(ys)
     yt = np.vectorize(cls2idx.get)(yt)
 
@@ -169,7 +169,7 @@ def load_LOO_data_cached(dataset, paradigm, target_subj):
 
     return Xs, ys, Xt, yt
 
-def train_subject(subj, dataset, paradigm, epochs, batch, lr, gp, mu, critic_steps, cri_hid, cls_hid, device):
+def train_subject(subj, dataset, paradigm, epochs, batch, lr, gp, mu, critic_steps, depth, cri_hid, cls_hid, device):
     Xs, ys, Xt, yt = load_LOO_data_cached(dataset, paradigm, subj)
     print(f"Train (source) dataset length: {len(Xs)}")
     print(f"Validation/Test (target) dataset length: {len(Xt)}")
@@ -183,23 +183,28 @@ def train_subject(subj, dataset, paradigm, epochs, batch, lr, gp, mu, critic_ste
     n_cls_t = int(yt.max().item()+1)
     print(f"=== Subject {subj} | C={C}, T={T}, classes={n_cls} === | n_cls_t={n_cls_t}")
 
-    tmpF = FeatureExtractor(C=C).to(device)
+    tmpF = FeatureExtractor(C=C, depth=depth).to(device)
     d = torch.zeros(4, C, T).to(device)
     feat_dim = tmpF(d).shape[1]
 
-    model = DANet(C=C, n_cls=n_cls, citic_hid=cri_hid, classifier_hidden=cls_hid, feat_dim=feat_dim)
+    model = DANet(C=C, depth=depth, n_cls=n_cls, citic_hid=cri_hid, classifier_hidden=cls_hid, feat_dim=feat_dim)
     model = nn.DataParallel(model, device_ids=[0,1])
     model = model.cuda()
     
     # weight_decay = 5e-4
-    opt_fc = torch.optim.Adam(list(model.module.F.parameters()), lr=lr[1])
-    opt_c = torch.optim.Adam(list(model.module.C.parameters()), lr=lr[1])
+    opt_fc = torch.optim.Adam(list(model.module.F.parameters()) + list(model.module.C.parameters()), lr=lr[1])
+    # opt_c = torch.optim.Adam(list(model.module.C.parameters()), lr=lr[1])
     opt_d = torch.optim.Adam(list(model.module.D.parameters()), lr=lr[0], betas=(0.5, 0.9))
 
     scheduler_fc = torch.optim.lr_scheduler.StepLR(opt_fc, step_size=50, gamma=0.5)
     scheduler_d  = torch.optim.lr_scheduler.StepLR(opt_d,  step_size=50, gamma=0.5)
     
     best_acc = 0.0
+    best_loss_f = 999.9
+    best_loss_d = 0.0
+    # Early stopping 설정
+    patience = 150             # 개선이 없을 때 최대 허용 Epoch 수
+    epochs_no_improve = 0
     for ep in trange(1, epochs+1, desc=f"{subj} Training"):
         tgt_iter = cycle(tgt_loader)  # 무한 순환 타겟 배치
         # train_pairs = zip(src_loader, tgt_loader)
@@ -223,7 +228,8 @@ def train_subject(subj, dataset, paradigm, epochs, batch, lr, gp, mu, critic_ste
             stats = train_iter(
                 model,
                 Xs_b, ys_b, Xt_b,
-                [opt_fc, opt_c, opt_d],
+                # [opt_fc, opt_c, opt_d],
+                [opt_fc, opt_d],
                 lambda_gp=gp, mu=mu, critic_steps=critic_steps)
             # set_postfix로 stats 출력
             batch_bar.set_postfix(
@@ -261,25 +267,35 @@ def train_subject(subj, dataset, paradigm, epochs, batch, lr, gp, mu, critic_ste
             "test/acc": acc,
             "test/kappa": kappa
         })
-        if ep%5==0 or ep==epochs:
-            best_acc = max(best_acc, acc)
-            # print(f"\nEp{ep:02d} → acc={acc:.5f}, κ={kappa:.5f}, lossD={stats['loss_D']:.5f}, cls={stats['cls']:.5f}")
+        # ——— Early Stopping 체크 ———
+        if best_loss_f > avg_lossF:
+            best_loss_f = avg_lossF
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+
+        # 개선 정체 시 종료
+        if epochs_no_improve >= patience:
+            print(f"\nNo improvement for {patience} epochs (best_acc={best_acc:.4f}), stopping early.")
+            break
 
     return best_acc, kappa
 
 if __name__=="__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--epochs", type=int, default=800)
+    p.add_argument("--epochs", type=int, default=8000)
     p.add_argument("--batch", type=int, default=64)
     p.add_argument("--critic_lr", type=float, default=1e-4)
     p.add_argument("--cls_lr", type=float, default=5e-4)
     p.add_argument("--lambda_gp", type=int, default=10)
     p.add_argument("--critic_steps", type=int, default=5)
-    p.add_argument("--mu", type=float, default=1)
+    p.add_argument("--mu", type=float, default=0.5)
     p.add_argument("--cri_hid", type=int, default=64)
+    p.add_argument("--depth_multiplier", type=int, default=2)
     p.add_argument("--cls_hid", type=int, default=64)
     p.add_argument("--device", default="cuda")
     args = p.parse_args()
+    # cbam reduction ration 16으로 돌렸었음, 4확인해야함
     
     # 1) device 설정
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -299,7 +315,7 @@ if __name__=="__main__":
         n_classes=4,
         channels=eeg22,
         tmin=2, tmax=6,
-        resample=250
+        # resample=250
     )
 
     results = {}
@@ -321,7 +337,7 @@ if __name__=="__main__":
             subj, dataset, paradigm,
             args.epochs, args.batch, [args.critic_lr, args.cls_lr],
             args.lambda_gp, args.mu, args.critic_steps,
-            args.cri_hid, args.cls_hid, device
+            args.depth_multiplier, args.cri_hid, args.cls_hid, device
         )
         results[subj] = {"accuracy":acc, "kappa":κ}
         wandb.run.summary["best_acc"] = acc

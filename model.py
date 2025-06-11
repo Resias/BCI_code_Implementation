@@ -3,13 +3,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import grad
 from scipy.signal import butter, filtfilt
+from scipy.signal import firwin
 import numpy as np
 
 # -------------------------------------------------------------
 # 1. Feature Extractor (CBAM + Sub‑band depthwise + Variance)
 # -------------------------------------------------------------
 class ChannelAttention(nn.Module):
-    def __init__(self, gate_channels, reduction_ratio=4):
+    def __init__(self, gate_channels, reduction_ratio=16):
         super().__init__()
         # 1D 풀링: (B, C, T) → (B, C, 1)
         self.avg_pool = nn.AdaptiveAvgPool1d(1)
@@ -66,7 +67,7 @@ class SpatialAttention(nn.Module):
         return x * scale
 
 class CBAM(nn.Module):
-	def __init__(self, gate_channels, reduction_ratio=16):
+	def __init__(self, gate_channels, reduction_ratio=4):
 		super(CBAM, self).__init__()
 		self.ChannelGate = ChannelAttention(gate_channels, reduction_ratio)
 		self.SpatialGate = SpatialAttention()
@@ -76,54 +77,103 @@ class CBAM(nn.Module):
 		x = self.SpatialGate(x)
 		return x
 
+# class FFTBandpass(nn.Module):
+#     def __init__(self, subbands, fs, T):
+#         """
+#         subbands: list of (fl, fh)
+#         fs: 샘플링 주파수
+#         T: 입력 시퀀스 길이 (예: 1000)
+#         """
+#         super().__init__()
+#         self.subbands = subbands
+#         self.fs = fs
+#         # 1) 주파수 축 계산
+#         freq = torch.fft.rfftfreq(T, d=1/fs)
+#         masks = []
+#         for fl, fh in subbands:
+#             # 각 서브밴드에 대한 마스크
+#             m = ((freq >= fl) & (freq <= fh)).float()
+#             masks.append(m)
+#         # (m, F) 형태로 뭉치고 buffer 로 등록
+#         self.register_buffer('masks', torch.stack(masks, dim=0))  # (m, F)
+
+#     def forward(self, x):
+#         """
+#         x: Tensor, shape (B, C, T)
+#         returns: Tensor, shape (B, m, C, T)
+#         """
+#         # 2) FFT
+#         X = torch.fft.rfft(x, dim=-1)               # (B, C, F)
+#         outs = []
+#         for m in self.masks:                        # m: (F,)
+#             # 채널·배치에 브로드캐스트
+#             Xm = X * (m.unsqueeze(0).unsqueeze(0))    # (B, C, F)
+#             # 3) IFFT
+#             x_bp = torch.fft.irfft(Xm, n=x.size(-1), dim=-1)  # (B, C, T)
+#             outs.append(x_bp)
+#         # 4) 서브밴드를 첫번째 dim 으로 쌓기
+#         return torch.stack(outs, dim=1)             # (B, m, C, T)
 class FFTBandpass(nn.Module):
-    def __init__(self, subbands, fs, T):
+    def __init__(self, subbands, fs, T, order=50):
         """
-        subbands: list of (fl, fh)
-        fs: 샘플링 주파수
-        T: 입력 시퀀스 길이 (예: 1000)
+        subbands: list of (fl, fh) tuples defining passbands
+        fs: sampling frequency
+        order: filter order (default 50)
         """
         super().__init__()
         self.subbands = subbands
         self.fs = fs
-        # 1) 주파수 축 계산
-        freq = torch.fft.rfftfreq(T, d=1/fs)  # (T//2+1,)
-        masks = []
+        self.order = order
+        self.numtaps = order + 1
+
+        # Precompute FIR taps for each subband using windowed-sinc (Hamming)
+        taps_list = []
         for fl, fh in subbands:
-            # 각 서브밴드에 대한 마스크
-            m = ((freq >= fl) & (freq <= fh)).float()
-            masks.append(m)
-        # (m, F) 형태로 뭉치고 buffer 로 등록
-        self.register_buffer('masks', torch.stack(masks, dim=0))  # (m, F)
+            taps = firwin(self.numtaps, [fl, fh], pass_zero=False, fs=fs, window='hamming')
+            taps_tensor = torch.tensor(taps, dtype=torch.float32).view(1, 1, self.numtaps)
+            taps_list.append(taps_tensor)
+
+        # Register taps as a buffer: shape (m, 1, numtaps)
+        self.register_buffer('taps', torch.stack(taps_list, dim=0))
 
     def forward(self, x):
         """
-        x: Tensor, shape (B, C, T)
-        returns: Tensor, shape (B, m, C, T)
+        x: Tensor of shape (B, C, T)
+        returns: Tensor of shape (B, m, C, T)
+        where m = number of subbands
         """
-        # 2) FFT
-        X = torch.fft.rfft(x, dim=-1)               # (B, C, F)
-        outs = []
-        for m in self.masks:                        # m: (F,)
-            # 채널·배치에 브로드캐스트
-            Xm = X * m.unsqueeze(0).unsqueeze(0)    # (B, C, F)
-            # 3) IFFT
-            x_bp = torch.fft.irfft(Xm, n=x.size(-1), dim=-1)  # (B, C, T)
-            outs.append(x_bp)
-        # 4) 서브밴드를 첫번째 dim 으로 쌓기
-        return torch.stack(outs, dim=1)             # (B, m, C, T)
+        B, C, T = x.shape
+        pad = self.numtaps - 1
+
+        # Causal filtering: pad only at the front
+        x_padded = F.pad(x, (pad, 0))  # shape (B, C, T + pad)
+        outputs = []
+
+        # Apply each subband filter via group convolution
+        for taps in self.taps:  # taps: (1, 1, numtaps)
+            # Expand to (C, 1, numtaps) so each channel uses the same filter
+            kernel = taps.repeat(C, 1, 1)
+            # Perform group conv: groups=C ensures channel-wise filtering
+            y = F.conv1d(x_padded, kernel, groups=C)
+            # y shape: (B, C, T)
+            outputs.append(y)
+
+        # Stack outputs: (B, m, C, T)
+        return torch.stack(outputs, dim=1)
+
 
 class DepthwiseConv(nn.Module):
     """
     입력:  x.shape = (B, m, C, T)    # m = 밴드 수 (여기서는 입력 채널)
     출력:  y.shape = (B, d, m, 1, T)
     """
-    def __init__(self, bands: int, depth_multiplier: int, num_electrodes: int):
+    def __init__(self, bands: int, depth_multiplier: int, num_electrodes: int, max_norm=1.0):
         super().__init__()
         self.bands = bands               # = in_channels
         self.depth = depth_multiplier   # = depth_multiplier
         # depthwise conv2d: out_channels = in_channels * depth_multiplier
         # groups = in_channels 으로 해야 각 채널마다 별도 필터 적용
+        self.max_norm = max_norm
         self.dw = nn.Conv2d(
             in_channels=bands,
             out_channels=bands * depth_multiplier,
@@ -137,34 +187,18 @@ class DepthwiseConv(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, m, C, T)
-        B, m, C, T = x.shape
+        # B, m, C, T = x.shape
         # 1) 바로 depthwise conv: (B, m, C, T) → (B, m*d, 1, T)
         y = self.dw(x)
-        y = self.bn_dw(y)                       # BatchNorm 적용
-        # 2) 채널(axis=1) 차원 m*d 를 (m, d) 로 분리
-        y = self.activation(y)                  # 활성화 함수
-        y = self.dropout(y)                     # 드롭아웃
+        # y = self.bn_dw(y)                       # BatchNorm 적용
+        # # 2) 채널(axis=1) 차원 m*d 를 (m, d) 로 분리
+        # y = self.activation(y)                  # 활성화 함수
+        # y = self.dropout(y)                     # 드롭아웃
         # y = y.view(B, m, self.depth, 1, T)      # (B, m, d, 1, T)
         # # 3) 축 순서 바꿔서 (B, d, m, 1, T) 로
         # y = y.permute(0, 2, 1, 3, 4)
-        return y
 
-# class VarianceLayer(nn.Module):
-#     def __init__(self, w):
-#         super().__init__()
-#         self.w = w
-#     def forward(self, x):   # (B,m,d,1,T)
-#         *front, T = x.shape
-#         pad_len = (-T) % self.w
-#         if pad_len > 0:
-#             x = F.pad(x, (0, pad_len), mode='constant', value=0.0)
-#         new_T = x.size(-1)
-#         num_win = new_T // self.w
-        
-#         x = x.view(*front, num_win, self.w)
-        
-#         v = x.var(dim=-1, unbiased=False)
-#         return torch.clamp(v, min=1e-6)
+        return y
 
 class VarianceLayer(nn.Module):
     """
@@ -202,42 +236,17 @@ class VarianceLayer(nn.Module):
 
         # 5) 분산 계산: (B, C, K)
         var = ((x - mu) ** 2).mean(dim=-1)
-
         # 6) 출력 형태 맞추기: (B, C, 1, K)
         y = var.unsqueeze(2)
         return y
 
 
 class FeatureExtractor(nn.Module):
-    def __init__(self, C=22, subbands=((8,12),(12,16),(16,20),(20,24),(24,28),(28,32)),
-                 depth=22, var_win=250, fs=250, fc_out=64):
+    def __init__(self, C=22, depth=2, subbands=((8,12),(12,16),(16,20),(20,24),(24,28),(28,30)),
+                  var_win=250, fs=250, fc_out=64):
         super().__init__()
         self.fs = fs
         self.subbands = subbands
-        
-        # self.band_filters = nn.ModuleList()
-        # numtaps = 101                                # 필터 길이 (홀수 권장)
-        # for fl, fh in self.subbands:
-        #     # normalized cutoff
-        #     nyq = 0.5 * self.fs
-        #     taps = firwin(numtaps,
-        #                   [fl/nyq, fh/nyq],
-        #                   pass_zero=False)
-        #     # 2) depthwise Conv1d (groups=C) 으로 필터링
-        #     conv = nn.Conv1d(in_channels=C,
-        #                      out_channels=C,
-        #                      kernel_size=numtaps,
-        #                      groups=C,
-        #                      bias=False,
-        #                      padding=numtaps//2)
-        #     # weight shape: (C, 1, numtaps)
-        #     conv.weight.data.copy_(
-        #         torch.tensor(taps, dtype=torch.float32)
-        #              .view(1,1,-1)
-        #              .repeat(C,1,1)
-        #     )
-        #     conv.weight.requires_grad = False   # 고정필터; 학습가능하게 두려면 True로
-        #     self.band_filters.append(conv)
         self.fft_bp = FFTBandpass(self.subbands, fs=self.fs, T=1000)
         
         self.depth_convs = DepthwiseConv(bands=len(subbands), depth_multiplier=depth, num_electrodes=C)
@@ -324,9 +333,9 @@ class Classifier(nn.Module):
 # 4. DANet wrapper
 # -------------------------------------------------------------
 class DANet(nn.Module):
-    def __init__(self, C=22, n_cls=4, citic_hid=512, classifier_hidden=64, feat_dim=None):
+    def __init__(self, C=22, n_cls=4, depth=2, citic_hid=512, classifier_hidden=64, feat_dim=None):
         super().__init__()
-        self.F = FeatureExtractor(C=C)
+        self.F = FeatureExtractor(C=C, depth=depth)
         if feat_dim is None:
             # 만일 누락되면 안전장치
             sample = torch.zeros(1, C, 1000)
@@ -345,19 +354,19 @@ def train_iter(model, src_x, src_y, tgt_x, opts,
                lambda_gp=10, mu=1.0, critic_steps=5):
 
     Fnet, Clf, Cri = model.module.F, model.module.C, model.module.D
-    opt_fc, opt_c, opt_d = opts
+    # opt_fc, opt_c, opt_d = opts
+    opt_fc, opt_d = opts
     device = next(Fnet.parameters()).device
     src_x, src_y, tgt_x = src_x.to(device), src_y.to(device), tgt_x.to(device)
     # print(src_x.shape, src_y.shape, tgt_x.shape)
     # exit()
-    model.eval()
     model.module.D.train()
     wd_critic_list, wd_feat_list = [], []
     # ── (i) critic update ─────────────────────────────
     for _ in range(critic_steps):
         # 특징은 gradient 차단
         with torch.no_grad():
-            h_s, _, _ = model(src_x)   # 여러 GPU에서 분산 계산
+            h_s, _, _ = model(src_x)
             h_t, _, _ = model(tgt_x)
             h_s = h_s.detach()
             h_t = h_t.detach()
@@ -375,23 +384,34 @@ def train_iter(model, src_x, src_y, tgt_x, opts,
     
     # ── (ii) feature + classifier update ─────────────
     model.train()
-    model.module.D.eval()
+    # opt_c.zero_grad()
+    opt_fc.zero_grad()
     
-    h_s, _, logit = model(src_x)
+    h_s = model.module.F(src_x)
+    logit = model.module.C(h_s)  # Classifier output
     loss_c = F.cross_entropy(logit, src_y)
-    loss_c_copy = loss_c.detach().clone()  # retain_graph=True 필요
-    opt_c.zero_grad()
-    loss_c.backward(retain_graph=True)  # retain_graph=True 필요
-    opt_c.step()
+    # loss_c_copy = loss_c.detach().clone()
+    # loss_c.backward()  # retain_graph=True 필요
+    # opt_c.step()
     
-    h_t, _, _ = model(tgt_x)
+    h_t = model.module.F(tgt_x)
     wd_feat = model.module.D(h_s).mean() - model.module.D(h_t).mean()
 
-    loss_f = (wd_feat * mu) + loss_c_copy
-    
-    opt_fc.zero_grad()
+    loss_f = (wd_feat * mu) + loss_c
     loss_f.backward()
     opt_fc.step()
+    
+    with torch.no_grad():
+        w = model.module.F.depth_convs.dw.weight  # shape: (out_ch, 1, kh, kw)
+        # Compute L2 norm over each filter
+        w_flat = w.view(w.size(0), -1)
+        norms = w_flat.norm(p=2, dim=1, keepdim=True)
+        # Clip norms to max_norm
+        desired = torch.clamp(norms, max=1.0)
+        # Scale weights
+        w_flat = w_flat * (desired / (1e-8 + norms))
+        model.module.F.depth_convs.dw.weight.copy_(w_flat.view_as(w))
+
     wd_feat_list.append(wd_feat.item())   # Feature 단계 직후의 wd 기록
 
     return {
@@ -419,7 +439,7 @@ def main():
     # 3) Critic / Classifier
     critic = Critic(in_dim=feat.shape[1])
     print("Critic output:", critic(feat).shape)      # (B,)
-    clf = Classifier(feat.shape[1], n_cls=4)
+    clf = Classifier(in_dim=feat.shape[1], n_cls=4)
     print("Classifier output:", clf(feat).shape)     # (B,4)
 
     # 4) DANet end-to-end
