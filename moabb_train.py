@@ -123,7 +123,7 @@ def make_loader(X, y=None, batch_size=64, shuffle=True):
     ds = TensorDataset(X) if y is None else TensorDataset(X,y)
     return DataLoader(ds,
                       batch_size=batch_size,
-                      drop_last=True)
+                      drop_last=False)
 
 def evaluate(model, loader):
     model.eval()
@@ -193,7 +193,7 @@ def train_subject(subj, dataset, paradigm, epochs, batch, lr, gp, mu, critic_ste
         tgt_dataset,
         batch_size=batch,
         sampler=tgt_sampler,
-        drop_last=True
+        drop_last=False
     )
     
     test_loader = make_loader(Xt, yt, batch)
