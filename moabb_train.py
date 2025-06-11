@@ -169,7 +169,7 @@ def load_LOO_data_cached(dataset, paradigm, target_subj):
 
     return Xs, ys, Xt, yt
 
-def train_subject(subj, dataset, paradigm, epochs, batch, lr, gp, mu, critic_steps, depth, cri_hid, cls_hid, device):
+def train_subject(subj, dataset, paradigm, epochs, batch, lr, gp, mu, critic_steps, depth, cri_hid, cls_hid, device, wb):
     Xs, ys, Xt, yt = load_LOO_data_cached(dataset, paradigm, subj)
     print(f"Train (source) dataset length: {len(Xs)}")
     print(f"Validation/Test (target) dataset length: {len(Xt)}")
@@ -188,7 +188,9 @@ def train_subject(subj, dataset, paradigm, epochs, batch, lr, gp, mu, critic_ste
     feat_dim = tmpF(d).shape[1]
 
     model = DANet(C=C, depth=depth, n_cls=n_cls, citic_hid=cri_hid, classifier_hidden=cls_hid, feat_dim=feat_dim)
-    model = nn.DataParallel(model, device_ids=[0,1])
+    ngpu = torch.cuda.device_count()
+
+    model = nn.DataParallel(model, device_ids=list(range(ngpu)))
     model = model.cuda()
     
     # weight_decay = 5e-4
@@ -203,7 +205,7 @@ def train_subject(subj, dataset, paradigm, epochs, batch, lr, gp, mu, critic_ste
     best_loss_f = 999.9
     best_loss_d = 0.0
     # Early stopping 설정
-    patience = 150             # 개선이 없을 때 최대 허용 Epoch 수
+    patience = 200             # 개선이 없을 때 최대 허용 Epoch 수
     epochs_no_improve = 0
     for ep in trange(1, epochs+1, desc=f"{subj} Training"):
         tgt_iter = cycle(tgt_loader)  # 무한 순환 타겟 배치
@@ -251,22 +253,24 @@ def train_subject(subj, dataset, paradigm, epochs, batch, lr, gp, mu, critic_ste
         avg_wd_feat   = sum_wd_feat / n_batches
         avg_lossF   = sum_lossF / n_batches
         
-        wandb.log({
-            "epoch": ep,
-            "loss_D": avg_lossD,
-            "cls_loss": avg_cls,
-            "wd_critic": avg_wd_critic,
-            "wd_feat": avg_wd_feat,
-            "loss_F": avg_lossF
-        })
+        if wb:
+            wandb.log({
+                "epoch": ep,
+                "loss_D": avg_lossD,
+                "cls_loss": avg_cls,
+                "wd_critic": avg_wd_critic,
+                "wd_feat": avg_wd_feat,
+                "loss_F": avg_lossF
+            })
         # scheduler_fc.step()
         # scheduler_d.step()
         acc, kappa = evaluate(model, test_loader)
-        wandb.log({
-            "epoch": ep,
-            "test/acc": acc,
-            "test/kappa": kappa
-        })
+        if wb:
+            wandb.log({
+                "epoch": ep,
+                "test/acc": acc,
+                "test/kappa": kappa
+            })
         # ——— Early Stopping 체크 ———
         if best_loss_f > avg_lossF:
             best_loss_f = avg_lossF
@@ -286,13 +290,14 @@ if __name__=="__main__":
     p.add_argument("--epochs", type=int, default=8000)
     p.add_argument("--batch", type=int, default=64)
     p.add_argument("--critic_lr", type=float, default=1e-4)
-    p.add_argument("--cls_lr", type=float, default=5e-4)
+    p.add_argument("--cls_lr", type=float, default=8e-4)
     p.add_argument("--lambda_gp", type=int, default=10)
     p.add_argument("--critic_steps", type=int, default=5)
     p.add_argument("--mu", type=float, default=0.5)
     p.add_argument("--cri_hid", type=int, default=64)
     p.add_argument("--depth_multiplier", type=int, default=2)
     p.add_argument("--cls_hid", type=int, default=64)
+    p.add_argument("--wandb", type=bool, default=True)
     p.add_argument("--device", default="cuda")
     args = p.parse_args()
     # cbam reduction ration 16으로 돌렸었음, 4확인해야함
@@ -321,28 +326,30 @@ if __name__=="__main__":
     results = {}
     for i in range(1,10):
         subj = f"A{i:02d}"
-        wandb.init(project="danet-eeg-0610", name=subj, config={
-            "epochs": args.epochs,
-            "batch_size": args.batch,
-            "critic learning_rate": args.critic_lr,
-            "cls learning_rate": args.cls_lr,
-            "lambda_gp": args.lambda_gp,
-            "mu": args.mu,
-            "critic_steps": args.critic_steps,
-            # "critic_hidden": args.cri_hid,
-            "classifier_hidden": args.cls_hid,
-            # "seed": seed
-        })
+        if args.wandb:
+            wandb.init(project="danet-eeg-0610", name=subj, config={
+                "epochs": args.epochs,
+                "batch_size": args.batch,
+                "critic learning_rate": args.critic_lr,
+                "cls learning_rate": args.cls_lr,
+                "lambda_gp": args.lambda_gp,
+                "mu": args.mu,
+                "critic_steps": args.critic_steps,
+                # "critic_hidden": args.cri_hid,
+                "classifier_hidden": args.cls_hid,
+                # "seed": seed
+            })
         acc, κ = train_subject(
             subj, dataset, paradigm,
             args.epochs, args.batch, [args.critic_lr, args.cls_lr],
             args.lambda_gp, args.mu, args.critic_steps,
-            args.depth_multiplier, args.cri_hid, args.cls_hid, device
+            args.depth_multiplier, args.cri_hid, args.cls_hid, device, args.wandb
         )
         results[subj] = {"accuracy":acc, "kappa":κ}
-        wandb.run.summary["best_acc"] = acc
-        wandb.run.summary["best_kappa"] = κ
-        wandb.finish()
+        if args.wandb:
+            wandb.run.summary["best_acc"] = acc
+            wandb.run.summary["best_kappa"] = κ
+            wandb.finish()
 
     print("\n=== Final LOO Results ===")
     with open("result.json", "w") as json_file:
