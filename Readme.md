@@ -1,1 +1,0 @@
-1. conda create -n [Environment Name] python=3.10
