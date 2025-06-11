@@ -119,11 +119,16 @@ def load_LOO_data(dataset, paradigm, target_subj):
     )
 
 # ─────── 이하 기존 코드 ───────
-def make_loader(X, y=None, batch_size=64, shuffle=True):
+def make_loader(X, y=None, batch_size=64, train=True):
     ds = TensorDataset(X) if y is None else TensorDataset(X,y)
-    return DataLoader(ds,
-                      batch_size=batch_size,
-                      drop_last=False)
+    if train:
+        sampler = RandomSampler(ds, replacement=True,
+                                num_samples=batch_size * len(ds))
+        return DataLoader(ds, batch_size=batch_size,
+                          sampler=sampler, drop_last=False)
+    else:
+        return DataLoader(ds, batch_size=batch_size,
+                          shuffle=False, drop_last=False)
 
 def evaluate(model, loader):
     model.eval()
@@ -173,30 +178,9 @@ def train_subject(subj, dataset, paradigm, epochs, batch, lr, gp, mu, critic_ste
     Xs, ys, Xt, yt = load_LOO_data_cached(dataset, paradigm, subj)
     print(f"Train (source) dataset length: {len(Xs)}")
     print(f"Validation/Test (target) dataset length: {len(Xt)}")
-    src_loader = make_loader(Xs, ys, batch)
-    # tgt_loader = make_loader(Xt, None, batch)
-    
-    # --- 랜덤 복원추출 sampler 설정 ---
-    # 몇 번의 배치를 뽑을지: src_loader 배치 수와 동일하게
-    num_src_batches = len(src_loader)
-
-    # TensorDataset 으로 다시 감싸고
-    tgt_dataset = TensorDataset(Xt)
-    # replacement=True 로 복원추출, 전체 샘플 수 = num_src_batches * batch
-    tgt_sampler = RandomSampler(
-        tgt_dataset,
-        replacement=True,
-        num_samples=num_src_batches * batch
-    )
-    # DataLoader 에 sampler 전달 (shuffle=False)
-    tgt_loader = DataLoader(
-        tgt_dataset,
-        batch_size=batch,
-        sampler=tgt_sampler,
-        drop_last=False
-    )
-    
-    test_loader = make_loader(Xt, yt, batch)
+    src_loader  = make_loader(Xs, ys, batch, train=True)
+    tgt_loader  = make_loader(Xt, None, batch, train=True)
+    test_loader = make_loader(Xt, yt, batch, train=False)
 
     C = Xs.shape[1]  # channels = 22
     T = Xs.shape[2]  # time points = 1000
@@ -288,6 +272,10 @@ def train_subject(subj, dataset, paradigm, epochs, batch, lr, gp, mu, critic_ste
         # scheduler_fc.step()
         # scheduler_d.step()
         acc, kappa = evaluate(model, test_loader)
+        if acc > best_acc:
+            best_acc = acc
+            best_loss_d = avg_lossD
+            print(f"New best accuracy: {best_acc:.4f} (epoch {ep})")
         if wb:
             wandb.log({
                 "epoch": ep,
