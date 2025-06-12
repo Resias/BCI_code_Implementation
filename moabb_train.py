@@ -123,7 +123,7 @@ def make_loader(X, y=None, batch_size=64, train=True):
     ds = TensorDataset(X) if y is None else TensorDataset(X,y)
     if train:
         sampler = RandomSampler(ds, replacement=True,
-                                num_samples=batch_size * len(ds))
+                                num_samples=batch_size * (len(ds) //batch_size + len(ds) % batch_size))
         return DataLoader(ds, batch_size=batch_size,
                           sampler=sampler, drop_last=False)
     else:
@@ -179,7 +179,19 @@ def train_subject(subj, dataset, paradigm, epochs, batch, lr, gp, mu, critic_ste
     print(f"Train (source) dataset length: {len(Xs)}")
     print(f"Validation/Test (target) dataset length: {len(Xt)}")
     src_loader  = make_loader(Xs, ys, batch, train=True)
-    tgt_loader  = make_loader(Xt, None, batch, train=True)
+    # tgt_loader  = make_loader(Xt, None, batch, train=True)
+    num_src_batches = len(src_loader)
+    tgt_sampler = RandomSampler(
+        TensorDataset(Xt),
+        replacement=True,
+        num_samples=num_src_batches * batch
+    )
+    tgt_loader = DataLoader(
+        TensorDataset(Xt),
+        batch_size=batch,
+        sampler=tgt_sampler,
+        drop_last=False
+    )
     test_loader = make_loader(Xt, yt, batch, train=False)
 
     C = Xs.shape[1]  # channels = 22
