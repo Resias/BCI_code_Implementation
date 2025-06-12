@@ -7,9 +7,14 @@ from scipy.signal import firwin
 import numpy as np
 
 # -------------------------------------------------------------
-# 1. Feature Extractor (CBAM + Sub‑band depthwise + Variance)
+# 1. Feature Extractor (CBAM + Sub‑band + depthwise + Variance)
 # -------------------------------------------------------------
 class ChannelAttention(nn.Module):
+    """
+    채널 어텐션 모듈 (CBAM의 Channel Gate)
+    - 입력: (B, C, T)
+    - 출력: (B, C, T) (채널별 스케일링 적용)
+    """
     def __init__(self, gate_channels, reduction_ratio=16):
         super().__init__()
         # 1D 풀링: (B, C, T) → (B, C, 1)
@@ -43,10 +48,9 @@ class ChannelAttention(nn.Module):
         
 class SpatialAttention(nn.Module):
     """
-    1D 입력 (B, C, T) 에서 채널 축 풀링 후 1×1 Conv1d 으로
-    공간 어텐션 맵 M_s(f)를 계산합니다. (n=1)
-    
-    수식 (2): M_s(f) = σ(f_{1×1}([f^s_avg; f^s_max]))
+    공간 어텐션 모듈 (CBAM의 Spatial Gate)
+    - 입력: (B, C, T)
+    - 출력: (B, C, T) (시간축 1×1 conv 후 스케일링)
     """
     def __init__(self):
         super().__init__()
@@ -67,6 +71,9 @@ class SpatialAttention(nn.Module):
         return x * scale
 
 class CBAM(nn.Module):
+    """
+    CBAM 모듈: ChannelAttention + SpatialAttention 순차 적용
+    """
 	def __init__(self, gate_channels, reduction_ratio=4):
 		super(CBAM, self).__init__()
 		self.ChannelGate = ChannelAttention(gate_channels, reduction_ratio)
@@ -77,63 +84,30 @@ class CBAM(nn.Module):
 		x = self.SpatialGate(x)
 		return x
 
-# class FFTBandpass(nn.Module):
-#     def __init__(self, subbands, fs, T):
-#         """
-#         subbands: list of (fl, fh)
-#         fs: 샘플링 주파수
-#         T: 입력 시퀀스 길이 (예: 1000)
-#         """
-#         super().__init__()
-#         self.subbands = subbands
-#         self.fs = fs
-#         # 1) 주파수 축 계산
-#         freq = torch.fft.rfftfreq(T, d=1/fs)
-#         masks = []
-#         for fl, fh in subbands:
-#             # 각 서브밴드에 대한 마스크
-#             m = ((freq >= fl) & (freq <= fh)).float()
-#             masks.append(m)
-#         # (m, F) 형태로 뭉치고 buffer 로 등록
-#         self.register_buffer('masks', torch.stack(masks, dim=0))  # (m, F)
-
-#     def forward(self, x):
-#         """
-#         x: Tensor, shape (B, C, T)
-#         returns: Tensor, shape (B, m, C, T)
-#         """
-#         # 2) FFT
-#         X = torch.fft.rfft(x, dim=-1)               # (B, C, F)
-#         outs = []
-#         for m in self.masks:                        # m: (F,)
-#             # 채널·배치에 브로드캐스트
-#             Xm = X * (m.unsqueeze(0).unsqueeze(0))    # (B, C, F)
-#             # 3) IFFT
-#             x_bp = torch.fft.irfft(Xm, n=x.size(-1), dim=-1)  # (B, C, T)
-#             outs.append(x_bp)
-#         # 4) 서브밴드를 첫번째 dim 으로 쌓기
-#         return torch.stack(outs, dim=1)             # (B, m, C, T)
-class FFTBandpass(nn.Module):
+class FIRBandPass(nn.Module):
+    """
+    FFT 기반 서브밴드 필터링 (FIR Hamming 윈도우)
+    - subbands: [(low, high), ...]
+    - fs: 샘플링 주파수
+    - order: 필터 차수 (numtaps = order+1)
+    - 입력: (B, C, T)
+    - 출력: (B, m, C, T)
+    """
     def __init__(self, subbands, fs, T, order=50):
-        """
-        subbands: list of (fl, fh) tuples defining passbands
-        fs: sampling frequency
-        order: filter order (default 50)
-        """
         super().__init__()
         self.subbands = subbands
         self.fs = fs
         self.order = order
         self.numtaps = order + 1
 
-        # Precompute FIR taps for each subband using windowed-sinc (Hamming)
+        # 각 밴드별 FIR 필터 탭 계산
         taps_list = []
         for fl, fh in subbands:
             taps = firwin(self.numtaps, [fl, fh], pass_zero=False, fs=fs, window='hamming')
             taps_tensor = torch.tensor(taps, dtype=torch.float32).view(1, 1, self.numtaps)
             taps_list.append(taps_tensor)
 
-        # Register taps as a buffer: shape (m, 1, numtaps)
+        # 버퍼로 등록 (m,1,numtaps)
         self.register_buffer('taps', torch.stack(taps_list, dim=0))
 
     def forward(self, x):
@@ -164,8 +138,9 @@ class FFTBandpass(nn.Module):
 
 class DepthwiseConv(nn.Module):
     """
-    입력:  x.shape = (B, m, C, T)    # m = 밴드 수 (여기서는 입력 채널)
-    출력:  y.shape = (B, d, m, 1, T)
+    서브밴드별 depthwise 2D convolution
+    - 입력: (B, m, C, T)
+    - 출력: (B, m*depth, 1, T)
     """
     def __init__(self, bands: int, depth_multiplier: int, num_electrodes: int, max_norm=1.0):
         super().__init__()
@@ -182,37 +157,17 @@ class DepthwiseConv(nn.Module):
             bias=False
         )
         self.bn_dw = nn.BatchNorm2d(bands * depth_multiplier)
-        self.activation = nn.ELU()
-        self.dropout = nn.Dropout(p=0.25)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, m, C, T)
-        # B, m, C, T = x.shape
-        # 1) 바로 depthwise conv: (B, m, C, T) → (B, m*d, 1, T)
         y = self.dw(x)
-        # y = self.bn_dw(y)                       # BatchNorm 적용
-        # # 2) 채널(axis=1) 차원 m*d 를 (m, d) 로 분리
-        # y = self.activation(y)                  # 활성화 함수
-        # y = self.dropout(y)                     # 드롭아웃
-        # y = y.view(B, m, self.depth, 1, T)      # (B, m, d, 1, T)
-        # # 3) 축 순서 바꿔서 (B, d, m, 1, T) 로
-        # y = y.permute(0, 2, 1, 3, 4)
-
         return y
 
 class VarianceLayer(nn.Module):
     """
-    Variance Layer: computes variance over non-overlapping temporal windows.
-
-    Input:
-        x of shape (B, C, 1, T)
-          - B: batch size
-          - C: 채널 수 (e.g., m * d)
-          - 1: spatial 차원 (이미 합쳐진 상태)
-          - T: 전체 타임포인트 수
-
-    Output:
-        y of shape (B, C, 1, K), where K = T // w
+    비중첩 시간창 분산 계산
+    - 입력: (B, C, 1, T)
+    - 출력: (B, C, 1, K) where K = T//w
     """
     def __init__(self, w: int):
         super(VarianceLayer, self).__init__()
@@ -242,12 +197,19 @@ class VarianceLayer(nn.Module):
 
 
 class FeatureExtractor(nn.Module):
+    """
+    전체 특성 추출기:
+    1) CBAM
+    2) FIRBandpass → (B,m,C,T)
+    3) DepthwiseConv → (B,m*depth,1,T)
+    4) VarianceLayer → (B,m*depth,1,T//w)
+    """
     def __init__(self, C=22, depth=2, subbands=((8,12),(12,16),(16,20),(20,24),(24,28),(28,30)),
                   var_win=250, fs=250, fc_out=64):
         super().__init__()
         self.fs = fs
         self.subbands = subbands
-        self.fft_bp = FFTBandpass(self.subbands, fs=self.fs, T=1000)
+        self.fft_bp = FIRBandPass(self.subbands, fs=self.fs, T=1000)
         
         self.depth_convs = DepthwiseConv(bands=len(subbands), depth_multiplier=depth, num_electrodes=C)
         self.cbams = CBAM(gate_channels=C)
@@ -258,52 +220,85 @@ class FeatureExtractor(nn.Module):
         B, C, T = x.shape
         x = self.cbams(x)
         
-        # for conv in self.band_filters:
-        #     bp = conv(x)     # (B, C, T) —> same shape
-        #     feats.append(bp)
-        # feats = torch.stack(feats, dim=1)           # → (B, m, C, T)
-        
         feats = self.fft_bp(x)         # (B, m, C, T)
         
         feats = self.depth_convs(feats)             # (B, d, m, 1, T)
         out = self.var(feats)                     # (B, d, m, 1, T//w)
 
-        # out = out.flatten(1)                # (B, d*m*(T//w))
-        # out  = self.fc(out)                 # (B, fc_out=64)
-        return out.flatten(1)                    # Flatten to (B, total_features)
+        return out                    
 
 # -------------------------------------------------------------
 # 2. Domain Discriminator (Critic)
 # -------------------------------------------------------------
 # class Critic(nn.Module):
-#     def __init__(self, in_dim, hid=2048):
+    # """
+    # WGAN-GP Critic 네트워크:
+    # - 입력: (B, in_dim, 1, T')
+    # - 출력: (B,1) critic score
+    # """
+#     def __init__(self, in_dim, hid=[512,256]):
 #         super().__init__()
-#         self.net = nn.Sequential(
-#             nn.Linear(in_dim,hid),
-#             nn.LeakyReLU(.2,True),
-#             nn.Linear(hid,hid),
-#             nn.LeakyReLU(.2,True),
-#             nn.Linear(hid,1)
-#             )
-#     def forward(self,h):
-#         return self.net(h).view(-1)
-class Critic(nn.Module):
-    def __init__(self, in_dim, hid=[512,256]):
-        super().__init__()
-        layers = []
-        dims = [in_dim] + hid
-        for in_d, out_d in zip(dims[:-1], dims[1:]):
-            layers += [nn.Linear(in_d, out_d),
-                       nn.LeakyReLU(0.2, True)]
-        layers += [nn.Linear(hid[-1], 1)]
-        self.net = nn.Sequential(*layers)
+#         layers = []
+#         dims = [in_dim] + hid
+#         for in_d, out_d in zip(dims[:-1], dims[1:]):
+#             layers += [nn.Linear(in_d, out_d),
+#                        nn.LeakyReLU(0.2, True)]
+#         layers += [nn.Linear(hid[-1], 1)]
+#         self.net = nn.Sequential(*layers)
 
-    def forward(self, h):
-        return self.net(h).view(-1, 1)
+#     def forward(self, h):
+#         return self.net(h).view(-1, 1)
+
+class Critic(nn.Module):
+    """
+    WGAN-GP Critic 네트워크:
+    - 입력: (B, in_dim, 1, T')
+    - 출력: (B,1) critic score
+    """
+    def __init__(self, in_dim: int = 12, hiddens: list = [64, 128]):
+        super(Critic, self).__init__()
+        layers = []
+        prev_channels = in_dim
+        # Two downsampling conv2d blocks: kernel (1,2), stride (1,2)
+        for feature in hiddens:
+            layers.append(
+                nn.Conv2d(
+                    in_channels=prev_channels,
+                    out_channels=feature,
+                    kernel_size=(1, 2),
+                    stride=(1, 2),
+                    padding=(0, 0)
+                )
+            )
+            layers.append(nn.LeakyReLU(0.2, inplace=True))
+            prev_channels = feature
+        # Final conv to collapse to a single scalar per sample
+        layers.append(
+            nn.Conv2d(
+                in_channels=prev_channels,
+                out_channels=1,
+                kernel_size=(1, 1),
+                stride=(1, 1),
+                padding=(0, 0)
+            )
+        )
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass.
+        x shape: (batch_size, 12, 1, 4)
+        Returns: (batch_size,) tensor of critic scores.
+        """
+        out = self.model(x)
+        return out.view(-1, 1)
 
 
 # Gradient penalty
 def gradient_penalty(critic, h_s, h_t, lambda_gp):
+    """
+    WGAN-GP gradient penalty 계산
+    """
     alpha = torch.rand(h_s.size(0), 1, device=h_s.device)
     h_hat = alpha * h_s + (1 - alpha) * h_t
     h_hat.requires_grad_(True)
@@ -316,6 +311,9 @@ def gradient_penalty(critic, h_s, h_t, lambda_gp):
 # 3. Classifier (2×FC)
 # -------------------------------------------------------------
 class Classifier(nn.Module):
+    """
+    분류기: 2단 FC + softmax
+    """
     def __init__(self,in_dim, n_cls, hidden=512):
         super().__init__()
         self.fc1=nn.Linear(in_dim,hidden)
@@ -323,6 +321,7 @@ class Classifier(nn.Module):
         self.bn1 = nn.BatchNorm1d(hidden)
         self.dropout = nn.Dropout(p=0.6)
     def forward(self,h):
+        h = h.flatten(1)  # Flatten to (B, in_dim)
         h = self.fc1(h)
         # h = self.bn1(h)
         # h = F.relu(h)
@@ -333,15 +332,18 @@ class Classifier(nn.Module):
 # 4. DANet wrapper
 # -------------------------------------------------------------
 class DANet(nn.Module):
+    """
+    Domain Adaptation Network (F + D + C)
+    """
     def __init__(self, C=22, n_cls=4, depth=2, citic_hid=512, classifier_hidden=64, feat_dim=None):
         super().__init__()
         self.F = FeatureExtractor(C=C, depth=depth)
         if feat_dim is None:
             # 만일 누락되면 안전장치
             sample = torch.zeros(1, C, 1000)
-            feat_dim = self.F(sample).shape[1]
+            feat_dim = self.F(sample).flatten(1).shape[1]
         # self.D = Critic(feat_dim, hid=citic_hid)
-        self.D = Critic(feat_dim)
+        self.D = Critic(in_dim=depth*6)
         self.C = Classifier(feat_dim, n_cls, hidden=classifier_hidden)
     def forward(self, x):
         h = self.F(x)
@@ -352,14 +354,17 @@ class DANet(nn.Module):
 # -------------------------------------------------------------
 def train_iter(model, src_x, src_y, tgt_x, opts,
                lambda_gp=10, mu=1.0, critic_steps=5):
+    """
+    1) Critic 업데이트 (WGAN-GP)
+    2) Feature+Classifier 업데이트
+    """
+    net = model.module if isinstance(model, torch.nn.DataParallel) else model
 
-    Fnet, Clf, Cri = model.module.F, model.module.C, model.module.D
-    # opt_fc, opt_c, opt_d = opts
+    Fnet, Clf, Cri = net.F, net.C, net.D
     opt_fc, opt_d = opts
     device = next(Fnet.parameters()).device
     src_x, src_y, tgt_x = src_x.to(device), src_y.to(device), tgt_x.to(device)
-    # print(src_x.shape, src_y.shape, tgt_x.shape)
-    # exit()
+    
     model.module.D.train()
     wd_critic_list, wd_feat_list = [], []
     # ── (i) critic update ─────────────────────────────
@@ -384,15 +389,11 @@ def train_iter(model, src_x, src_y, tgt_x, opts,
     
     # ── (ii) feature + classifier update ─────────────
     model.train()
-    # opt_c.zero_grad()
     opt_fc.zero_grad()
     
     h_s = model.module.F(src_x)
     logit = model.module.C(h_s)  # Classifier output
     loss_c = F.cross_entropy(logit, src_y)
-    # loss_c_copy = loss_c.detach().clone()
-    # loss_c.backward()  # retain_graph=True 필요
-    # opt_c.step()
     
     h_t = model.module.F(tgt_x)
     wd_feat = model.module.D(h_s).mean() - model.module.D(h_t).mean()
@@ -401,6 +402,7 @@ def train_iter(model, src_x, src_y, tgt_x, opts,
     loss_f.backward()
     opt_fc.step()
     
+    # DepthwiseConv 가중치 Clip (max_norm)
     with torch.no_grad():
         w = model.module.F.depth_convs.dw.weight  # shape: (out_ch, 1, kh, kw)
         # Compute L2 norm over each filter
@@ -422,6 +424,7 @@ def train_iter(model, src_x, src_y, tgt_x, opts,
         'loss_f': loss_f.item()
     }
 
+# 테스트용 main 함수
 def main():
     B, C, T = 4, 22, 1000
     x = torch.randn(B, C, T)
@@ -439,15 +442,17 @@ def main():
     # 3) Critic / Classifier
     critic = Critic(in_dim=feat.shape[1])
     print("Critic output:", critic(feat).shape)      # (B,)
-    clf = Classifier(in_dim=feat.shape[1], n_cls=4)
+    clf = Classifier(in_dim=feat.flatten(1).shape[1], n_cls=4)
     print("Classifier output:", clf(feat).shape)     # (B,4)
 
     # 4) DANet end-to-end
-    net = DANet(C=C, n_cls=4, feat_dim=feat.shape[1])
+    net = DANet(C=C, n_cls=4)
     feat2 = net.F(x)
     print("DANet Feature:", feat2.shape)
     print("DANet Critic:", net.D(feat2).shape)
     print("DANet Classifier:", net.C(feat2).shape)
+    h, d, c =net(x)
+    print("DANet outputs:", h.shape, d.shape, c.shape)
 
 if __name__ == "__main__":
     main()
