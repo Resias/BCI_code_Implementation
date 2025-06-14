@@ -71,15 +71,15 @@ class SpatialAttention(nn.Module):
         return x * scale
 
 class CBAM(nn.Module):
-	def __init__(self, gate_channels, reduction_ratio=16):
-		super(CBAM, self).__init__()
-		self.ChannelGate = ChannelAttention(gate_channels, reduction_ratio)
-		self.SpatialGate = SpatialAttention()
+    def __init__(self, gate_channels, reduction_ratio=16):
+        super(CBAM, self).__init__()
+        self.ChannelGate = ChannelAttention(gate_channels, reduction_ratio)
+        self.SpatialGate = SpatialAttention()
 
-	def forward(self, x):
-		x = self.ChannelGate(x)
-		x = self.SpatialGate(x)
-		return x
+    def forward(self, x):
+        x = self.ChannelGate(x)
+        x = self.SpatialGate(x)
+        return x
 
 class FIRBandPass(nn.Module):
     """
