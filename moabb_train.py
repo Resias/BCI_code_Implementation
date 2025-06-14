@@ -171,7 +171,9 @@ def evaluate(model, loader):
     """
     model.eval()
     Ys, Ps = [], []
-    device = next(model.module.F.parameters()).device
+    net = model.module if isinstance(model, torch.nn.DataParallel) else model
+
+    device = next(net.F.parameters()).device
     with torch.no_grad():
         for batch in loader:
             X = batch[0].to(device)
