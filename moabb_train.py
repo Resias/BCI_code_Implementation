@@ -177,7 +177,7 @@ def evaluate(model, loader):
     with torch.no_grad():
         for batch in loader:
             X = batch[0].to(device)
-            _, _, pred = model(X)
+            _, _, pred = net(X)
             p_ = pred.argmax(dim=1)
             Ps.append(p_.cpu())
             Ys.append(batch[1].cpu())
