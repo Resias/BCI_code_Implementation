@@ -172,7 +172,7 @@ def evaluate(model, loader):
     model.eval()
     Ys, Ps = [], []
     net = model.module if isinstance(model, torch.nn.DataParallel) else model
-
+    
     device = next(net.F.parameters()).device
     with torch.no_grad():
         for batch in loader:
@@ -261,17 +261,19 @@ def train_subject(subj, dataset, paradigm, epochs, batch, lr, gp, mu, critic_ste
         # 여러 GPU가 있을 때
         model = nn.DataParallel(model, device_ids=list(range(ngpu)))
     model = model.to(device)
+    net = model.module if isinstance(model, torch.nn.DataParallel) else model
+
     
     # weight_decay = 5e-4
     if device.type == 'cuda' and ngpu > 1:
         # 여러 GPU가 있을 때
-        opt_fc = torch.optim.Adam(list(model.module.F.parameters()) + list(model.module.C.parameters()), lr=lr[1])
+        opt_fc = torch.optim.Adam(list(net.F.parameters()) + list(net.C.parameters()), lr=lr[1])
         # opt_c = torch.optim.Adam(list(model.module.C.parameters()), lr=lr[1])
-        opt_d = torch.optim.Adam(list(model.module.D.parameters()), lr=lr[0], betas=(0.5, 0.9))
+        opt_d = torch.optim.Adam(list(net.D.parameters()), lr=lr[0], betas=(0.5, 0.9))
     else:
-        opt_fc = torch.optim.Adam(list(model.F.parameters()) + list(model.C.parameters()), lr=lr[1])
+        opt_fc = torch.optim.Adam(list(net.F.parameters()) + list(net.C.parameters()), lr=lr[1])
         # opt_c = torch.optim.Adam(list(model.module.C.parameters()), lr=lr[1])
-        opt_d = torch.optim.Adam(list(model.D.parameters()), lr=lr[0], betas=(0.5, 0.9))
+        opt_d = torch.optim.Adam(list(net.D.parameters()), lr=lr[0], betas=(0.5, 0.9))
 
     best_acc = 0.0
     best_loss_f = 999.9
