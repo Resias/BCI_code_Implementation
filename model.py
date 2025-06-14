@@ -395,9 +395,17 @@ def train_iter(model, src_x, src_y, tgt_x, opts,
     h_t = net.F(tgt_x)
     wd_feat = net.D(h_s).mean() - net.D(h_t).mean()
 
-    loss_f = (wd_feat * mu) + loss_c
+    if not hasattr(train_iter, "g"):
+        train_iter.g = 0
+    train_iter.g += 1
+    mu_t = mu * min(1.0, train_iter.g / 100.0)
+
+    loss_f = (wd_feat * mu_t) + loss_c
+
+    # loss_f = (wd_feat * mu) + loss_c
     loss_f.backward()
     opt_fc.step()
+    
     
     # DepthwiseConv 가중치 Clip (max_norm)
     with torch.no_grad():
