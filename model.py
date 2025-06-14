@@ -71,10 +71,7 @@ class SpatialAttention(nn.Module):
         return x * scale
 
 class CBAM(nn.Module):
-    """
-    CBAM 모듈: ChannelAttention + SpatialAttention 순차 적용
-    """
-	def __init__(self, gate_channels, reduction_ratio=4):
+	def __init__(self, gate_channels, reduction_ratio=16):
 		super(CBAM, self).__init__()
 		self.ChannelGate = ChannelAttention(gate_channels, reduction_ratio)
 		self.SpatialGate = SpatialAttention()
