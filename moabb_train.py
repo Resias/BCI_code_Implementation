@@ -359,11 +359,11 @@ if __name__=="__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--epochs", type=int, default=8000)
     p.add_argument("--batch", type=int, default=64)
-    p.add_argument("--critic_lr", type=float, default=1e-3)
-    p.add_argument("--cls_lr", type=float, default=1e-3)
+    p.add_argument("--critic_lr", type=float, default=5e-4)
+    p.add_argument("--cls_lr", type=float, default=5e-4)
     p.add_argument("--lambda_gp", type=int, default=10)
-    p.add_argument("--critic_steps", type=int, default=5)
-    p.add_argument("--mu", type=float, default=1)
+    p.add_argument("--critic_steps", type=int, default=3)
+    p.add_argument("--mu", type=float, default=0.5)
     p.add_argument("--cri_hid", type=int, default=64)
     p.add_argument("--depth_multiplier", type=int, default=2)
     p.add_argument("--cls_hid", type=int, default=64)
@@ -407,6 +407,7 @@ if __name__=="__main__":
                 "lambda_gp": args.lambda_gp,
                 "mu": args.mu,
                 "critic_steps": args.critic_steps,
+                "depth_multiplier": args.depth_multiplier,
                 "classifier_hidden": args.cls_hid,
                 "seed": seed
             })
